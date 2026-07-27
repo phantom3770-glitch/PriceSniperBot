@@ -31,7 +31,7 @@ from dotenv import load_dotenv
 # .env ОБЯЗАТЕЛЬНО загрузить до импорта локальных модулей
 load_dotenv()
 
-from aiogram import Bot, Dispatcher, F, Router
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
@@ -45,11 +45,14 @@ from aiogram.types import (
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
+    TelegramObject,
+    User,
 )
 
 from admin import ADMIN_ID, admin_router
 from database import (
     delete_item,
+    ensure_user,
     get_user_items,
     get_user_language,
     init_db,
@@ -60,6 +63,33 @@ from database import (
 from locales import t
 from parser import ParseResult, parse_product
 from scheduler import start_scheduler
+
+# ── Middleware автосохранения пользователей ───────────────────────────────────
+class UserAutoSaveMiddleware(BaseMiddleware):
+    """
+    Middleware для автоматического сохранения любого пользователя в таблицу users
+    при вызове /start, отправке сообщений или нажатии любых кнопок.
+    """
+
+    async def __call__(
+        self,
+        handler,
+        event: TelegramObject,
+        data: dict,
+    ):
+        event_user: User | None = data.get("event_from_user")
+        if event_user:
+            lang = "en"
+            if event_user.language_code:
+                code = event_user.language_code.lower()
+                if code in ("uk", "ru", "en"):
+                    lang = code
+                elif code.startswith("uk") or code.startswith("ua"):
+                    lang = "uk"
+                elif code.startswith("ru"):
+                    lang = "ru"
+            await ensure_user(event_user.id, default_lang=lang)
+        return await handler(event, data)
 
 # ── Конфигурация ──────────────────────────────────────────────────────────────
 BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
@@ -509,6 +539,9 @@ async def main() -> None:
     await _set_bot_commands(bot)
 
     dp = Dispatcher(storage=MemoryStorage())
+    dp.message.outer_middleware(UserAutoSaveMiddleware())
+    dp.callback_query.outer_middleware(UserAutoSaveMiddleware())
+
     # admin_router ОБЯЗАТЕЛЬНО регистрируем первым:
     # его FSM-фильтр (BroadcastState) должен перехватывать сообщения
     # раньше, чем универсальный F.text-обработчик основного роутера.

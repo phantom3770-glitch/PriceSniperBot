@@ -8,11 +8,13 @@ database.py — асинхронная работа с SQLite через aiosqli
 
 import os
 from datetime import datetime, timezone
+from pathlib import Path
 
 import aiosqlite
 
-# Путь к файлу БД рядом с модулем
-DB_PATH = os.path.join(os.path.dirname(__file__), "price_sniper.db")
+# Единый явный абсолютный путь к файлу БД относительно корня проекта
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = os.getenv("DB_PATH", str((BASE_DIR / "price_sniper.db").resolve()))
 
 
 # ── Инициализация ─────────────────────────────────────────────────────────────
@@ -43,6 +45,22 @@ async def init_db() -> None:
 
 
 # ── Users ─────────────────────────────────────────────────────────────────────
+async def ensure_user(user_id: int, default_lang: str = "en") -> None:
+    """
+    Гарантирует, что пользователь существует в БД.
+    Если запись уже есть, её данные (включая выбор языка) не перезаписываются.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO users (user_id, language) VALUES (?, ?)
+            ON CONFLICT(user_id) DO NOTHING
+            """,
+            (user_id, default_lang),
+        )
+        await db.commit()
+
+
 async def upsert_user(user_id: int, language: str) -> None:
     """Создаёт или обновляет запись пользователя с его языком."""
     async with aiosqlite.connect(DB_PATH) as db:
