@@ -25,6 +25,7 @@ import logging
 import os
 import re
 
+from aiohttp import web
 from dotenv import load_dotenv
 
 # .env ОБЯЗАТЕЛЬНО загрузить до импорта локальных модулей
@@ -514,6 +515,16 @@ async def main() -> None:
     dp.include_router(admin_router)
     dp.include_router(router)
 
+    # Запускаем фоновый HTTP-сервер для Render Health Check
+    port = int(os.getenv("PORT", "8080"))
+    app = web.Application()
+    app.router.add_get("/", lambda r: web.Response(text="Bot is running!"))
+    app_runner = web.AppRunner(app)
+    await app_runner.setup()
+    site = web.TCPSite(app_runner, "0.0.0.0", port)
+    await site.start()
+    logger.info("🌐 Health check web server running on port %s", port)
+
     # Запускаем планировщик фоновой проверки цен
     scheduler_task = start_scheduler(bot)
 
@@ -521,6 +532,7 @@ async def main() -> None:
     try:
         await dp.start_polling(bot, skip_updates=True)
     finally:
+        await app_runner.cleanup()
         scheduler_task.cancel()
         try:
             await scheduler_task
@@ -531,3 +543,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
