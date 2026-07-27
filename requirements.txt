@@ -1,0 +1,6 @@
+aiogram==3.16.0
+python-dotenv==1.1.1
+httpx==0.28.1
+beautifulsoup4==4.13.4
+google-genai==1.19.0
+aiosqlite==0.21.0
