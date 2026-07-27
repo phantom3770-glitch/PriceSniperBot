@@ -34,7 +34,7 @@ load_dotenv()
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     BotCommand,
@@ -42,6 +42,9 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InlineQuery,
+    InlineQueryResultArticle,
+    InputTextMessageContent,
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
@@ -53,6 +56,7 @@ from admin import ADMIN_ID, admin_router
 from database import (
     delete_item,
     ensure_user,
+    get_item_by_id,
     get_user_items,
     get_user_language,
     init_db,
@@ -117,6 +121,7 @@ URL_RE = re.compile(
 _LIST_BTNS        = {"📋 Мої товари",    "📋 My Items",      "📋 Мои товары"}
 _REFRESH_BTNS     = {"🔄 Оновити ціни",  "🔄 Refresh Prices","🔄 Обновить цены"}
 _CHANGE_LANG_BTNS = {"🌐 Змінити мову",  "🌐 Change Language","🌐 Сменить язык"}
+_INVITE_BTNS      = {"🎁 Запросити друга", "🎁 Invite Friend", "🎁 Пригласить друга"}
 
 
 # ── Функции построения клавиатур ──────────────────────────────────────────────
@@ -129,6 +134,7 @@ def _main_kb(lang: str) -> ReplyKeyboardMarkup:
                 KeyboardButton(text=t(lang, "btn_refresh")),
                 KeyboardButton(text=t(lang, "btn_change_lang")),
             ],
+            [KeyboardButton(text=t(lang, "btn_invite_friend"))],
         ],
         resize_keyboard=True,
         persistent=True,
@@ -159,7 +165,7 @@ def _lang_kb(lang: str | None = None) -> InlineKeyboardMarkup:
 
 
 def _item_kb(item_id: int, url: str, lang: str) -> InlineKeyboardMarkup:
-    """Инлайн-клавиатура под карточкой товара: [🗑 Удалить] [🔗 Открыть]."""
+    """Инлайн-клавиатура под карточкой товара: [🗑 Удалить] [🔗 Открыть] [📤 Поделиться]."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -171,7 +177,13 @@ def _item_kb(item_id: int, url: str, lang: str) -> InlineKeyboardMarkup:
                     text=t(lang, "btn_open_link"),
                     url=url,
                 ),
-            ]
+            ],
+            [
+                InlineKeyboardButton(
+                    text=t(lang, "btn_share_item"),
+                    switch_inline_query=f"item_{item_id}",
+                ),
+            ],
         ]
     )
 
@@ -310,9 +322,43 @@ def _no_lang_prompt() -> str:
 
 # ── /start ────────────────────────────────────────────────────────────────────
 @router.message(CommandStart())
-async def cmd_start(message: Message) -> None:
+async def cmd_start(message: Message, command: CommandObject) -> None:
     user_id = message.from_user.id  # type: ignore[union-attr]
     lang = await _get_lang(user_id)
+    args = command.args
+
+    # Обработка глубокой ссылки (/start item_123)
+    if args and args.startswith("item_"):
+        item_id_str = args.removeprefix("item_")
+        if item_id_str.isdigit():
+            item_id = int(item_id_str)
+            item = await get_item_by_id(item_id)
+            if item:
+                display_lang = lang or "en"
+                card_text = (
+                    f"🎁 <b>{t(display_lang, 'deep_link_item_prompt')}</b>\n\n"
+                    f"{_card_from_db(display_lang, item)}"
+                )
+                kb = InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [
+                            InlineKeyboardButton(
+                                text=t(display_lang, "btn_add_to_tracking"),
+                                callback_data=f"add:{item_id}",
+                            ),
+                            InlineKeyboardButton(
+                                text=t(display_lang, "btn_open_link"),
+                                url=item["url"],
+                            ),
+                        ]
+                    ]
+                )
+                await message.answer(
+                    card_text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kb,
+                )
+                return
 
     if lang:
         await message.answer(
@@ -402,6 +448,35 @@ async def cb_delete_item(callback: CallbackQuery) -> None:
     await callback.answer(t(lang, "item_deleted_popup"), show_alert=False)
 
 
+# ── Callback: добавление товара по шеринг-ссылке ──────────────────────────────
+@router.callback_query(F.data.startswith("add:"))
+async def cb_add_shared_item(callback: CallbackQuery) -> None:
+    item_id = int(callback.data.split(":")[1])  # type: ignore[union-attr]
+    user_id = callback.from_user.id
+    lang = await _get_lang(user_id) or "en"
+
+    item = await get_item_by_id(item_id)
+    if not item:
+        await callback.answer(t(lang, "parse_error"), show_alert=True)
+        return
+
+    new_item_id = await save_item(
+        user_id=user_id,
+        url=item["url"],
+        title=item["title"] or "",
+        price=item["price"] or "",
+        currency=item["currency"] or "",
+        is_in_stock=bool(item["is_in_stock"]),
+    )
+
+    await callback.message.edit_text(  # type: ignore[union-attr]
+        f"{_card_from_db(lang, item)}\n\n{t(lang, 'item_added')}",
+        parse_mode=ParseMode.HTML,
+        reply_markup=_item_kb(new_item_id, item["url"], lang),
+    )
+    await callback.answer(t(lang, "item_added_popup"), show_alert=False)
+
+
 # ── 📋 Мои товары ─────────────────────────────────────────────────────────────
 @router.message(F.text.in_(_LIST_BTNS))
 async def btn_my_items(message: Message) -> None:
@@ -459,6 +534,80 @@ async def btn_change_lang(message: Message) -> None:
         _no_lang_prompt(),
         reply_markup=_lang_kb(lang),  # с кнопкой «Назад» — язык уже выбран
     )
+
+
+# ── 🎁 Пригласить друга (ReplyKeyboard кнопка) ────────────────────────────────
+@router.message(F.text.in_(_INVITE_BTNS))
+async def btn_invite_friend(message: Message) -> None:
+    user_id = message.from_user.id  # type: ignore[union-attr]
+    lang = await _get_lang(user_id) or "en"
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=t(lang, "btn_send_to_friend"),
+                    switch_inline_query="",
+                )
+            ]
+        ]
+    )
+    await message.answer(
+        t(lang, "invite_msg"),
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb,
+    )
+
+
+# ── Inline Query (для кнопок switch_inline_query) ─────────────────────────────
+@router.inline_query()
+async def inline_query_handler(query: InlineQuery) -> None:
+    user_id = query.from_user.id
+    lang = await _get_lang(user_id) or "en"
+    raw_q = query.query.strip()
+
+    results = []
+    if raw_q.startswith("item_"):
+        item_id_str = raw_q.removeprefix("item_")
+        if item_id_str.isdigit():
+            item_id = int(item_id_str)
+            item = await get_item_by_id(item_id)
+            if item:
+                title = item.get("title") or t(lang, "title_unknown")
+                share_text = t(
+                    lang,
+                    "share_item_text",
+                    title=title,
+                    item_id=str(item_id),
+                )
+                results.append(
+                    InlineQueryResultArticle(
+                        id=f"share_item_{item_id}",
+                        title=title,
+                        description=t(lang, "btn_share_item"),
+                        input_message_content=InputTextMessageContent(
+                            message_text=share_text,
+                            parse_mode=ParseMode.HTML,
+                        ),
+                    )
+                )
+
+    if not results:
+        # Шеринг самого бота
+        share_bot_text = t(lang, "share_bot_text")
+        results.append(
+            InlineQueryResultArticle(
+                id="share_bot",
+                title="PriceSniper Bot",
+                description=t(lang, "share_bot_desc"),
+                input_message_content=InputTextMessageContent(
+                    message_text=share_bot_text,
+                    parse_mode=ParseMode.HTML,
+                ),
+            )
+        )
+
+    await query.answer(results, cache_time=1, is_personal=True)
 
 
 # ── Обработчик URL (текстовые сообщения) ─────────────────────────────────────

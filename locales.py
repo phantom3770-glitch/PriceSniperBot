@@ -24,14 +24,37 @@ TEXTS: dict[str, dict[str, str]] = {
         "language_set": "✅ Мову змінено: Українська 🇺🇦",
 
         # Кнопки головного меню (ReplyKeyboard)
-        "btn_my_items":   "📋 Мої товари",
-        "btn_refresh":    "🔄 Оновити ціни",
-        "btn_change_lang":"🌐 Змінити мову",
+        "btn_my_items":      "📋 Мої товари",
+        "btn_refresh":       "🔄 Оновити ціни",
+        "btn_change_lang":   "🌐 Змінити мову",
+        "btn_invite_friend": "🎁 Запросити друга",
 
         # Кнопки інлайн-клавіатури на картці товару
-        "btn_delete":     "🗑 Видалити",
-        "btn_open_link":  "🔗 Перейти",
-        "btn_back":       "🔙 Назад",
+        "btn_delete":          "🗑 Видалити",
+        "btn_open_link":       "🔗 Перейти",
+        "btn_back":            "🔙 Назад",
+        "btn_share_item":      "📤 Поділитися товаром",
+        "btn_send_to_friend":  "📤 Надіслати другу",
+        "btn_add_to_tracking": "✅ Додати до відстеження",
+
+        # Повідомлення про посилання / шеринг
+        "invite_msg": (
+            "🎁 <b>Запросіть друзів до PriceSniper!</b>\n\n"
+            "Діліться ботом з друзями та відстежуйте знижки на товари разом."
+        ),
+        "share_item_text": (
+            "Дивись, який товар я відстежую через @PriceSniper_tracker_bot! "
+            "Давай ловити знижку разом: {title}\n"
+            "https://t.me/PriceSniper_tracker_bot?start=item_{item_id}"
+        ),
+        "share_bot_text": (
+            "Крутий бот для відстеження цін та наявності товарів у магазинах! "
+            "Рекомендую: https://t.me/PriceSniper_tracker_bot"
+        ),
+        "share_bot_desc": "Поділитися ботом PriceSniper",
+        "deep_link_item_prompt": (
+            "Твій друг відстежує цей товар! Бажаєш також додати його до свого списку?"
+        ),
 
         # Парсинг
         "parsing_start": "🔍 <i>Снайпер вивчає сторінку...</i>",
@@ -58,6 +81,7 @@ TEXTS: dict[str, dict[str, str]] = {
         # Видалення
         "item_deleted":       "🗑 <i>Товар вилучено з відстеження.</i>",
         "item_deleted_popup": "Товар вилучено ✓",
+        "item_added_popup":   "Товар додано ✓",
 
         # Ручне оновлення
         "refresh_start":    "🔄 <i>Оновлюю дані по вашим товарам...</i>",
@@ -103,14 +127,37 @@ TEXTS: dict[str, dict[str, str]] = {
         "language_set": "✅ Language changed: English 🇬🇧",
 
         # Main menu buttons (ReplyKeyboard)
-        "btn_my_items":   "📋 My Items",
-        "btn_refresh":    "🔄 Refresh Prices",
-        "btn_change_lang":"🌐 Change Language",
+        "btn_my_items":      "📋 My Items",
+        "btn_refresh":       "🔄 Refresh Prices",
+        "btn_change_lang":   "🌐 Change Language",
+        "btn_invite_friend": "🎁 Invite Friend",
 
         # Inline keyboard buttons on item card
-        "btn_delete":    "🗑 Delete",
-        "btn_open_link": "🔗 Open Link",
-        "btn_back":      "🔙 Back",
+        "btn_delete":          "🗑 Delete",
+        "btn_open_link":       "🔗 Open Link",
+        "btn_back":            "🔙 Back",
+        "btn_share_item":      "📤 Share Item",
+        "btn_send_to_friend":  "📤 Send to Friend",
+        "btn_add_to_tracking": "✅ Add to Tracking",
+
+        # Sharing / Invite messages
+        "invite_msg": (
+            "🎁 <b>Invite friends to PriceSniper!</b>\n\n"
+            "Share the bot with your friends and track product discounts together."
+        ),
+        "share_item_text": (
+            "Check out this item I'm tracking via @PriceSniper_tracker_bot! "
+            "Let me know if you want to catch the discount together: {title}\n"
+            "https://t.me/PriceSniper_tracker_bot?start=item_{item_id}"
+        ),
+        "share_bot_text": (
+            "Awesome bot for tracking price drops and stock availability in online stores! "
+            "Check it out: https://t.me/PriceSniper_tracker_bot"
+        ),
+        "share_bot_desc": "Share PriceSniper Bot",
+        "deep_link_item_prompt": (
+            "Your friend is tracking this item! Want to add it to your list as well?"
+        ),
 
         # Parsing
         "parsing_start": "🔍 <i>Sniper is studying the page...</i>",
@@ -137,6 +184,7 @@ TEXTS: dict[str, dict[str, str]] = {
         # Deletion
         "item_deleted":       "🗑 <i>Item removed from tracking.</i>",
         "item_deleted_popup": "Item removed ✓",
+        "item_added_popup":   "Item added ✓",
 
         # Manual refresh
         "refresh_start":    "🔄 <i>Refreshing data for your items...</i>",
@@ -182,14 +230,37 @@ TEXTS: dict[str, dict[str, str]] = {
         "language_set": "✅ Язык изменён: Русский 🇷🇺",
 
         # Кнопки главного меню (ReplyKeyboard)
-        "btn_my_items":   "📋 Мои товары",
-        "btn_refresh":    "🔄 Обновить цены",
-        "btn_change_lang":"🌐 Сменить язык",
+        "btn_my_items":      "📋 Мои товары",
+        "btn_refresh":       "🔄 Обновить цены",
+        "btn_change_lang":   "🌐 Сменить язык",
+        "btn_invite_friend": "🎁 Пригласить друга",
 
         # Инлайн-кнопки на карточке товара
-        "btn_delete":    "🗑 Удалить",
-        "btn_open_link": "🔗 Перейти",
-        "btn_back":      "🔙 Назад",
+        "btn_delete":          "🗑 Удалить",
+        "btn_open_link":       "🔗 Перейти",
+        "btn_back":            "🔙 Назад",
+        "btn_share_item":      "📤 Поделиться товаром",
+        "btn_send_to_friend":  "📤 Отправить другу",
+        "btn_add_to_tracking": "✅ Добавить в отслеживание",
+
+        # Сообщения при шеринге и приглашениях
+        "invite_msg": (
+            "🎁 <b>Пригласите друзей в PriceSniper!</b>\n\n"
+            "Делитесь ботом с друзьями и отслеживайте скидки на товары вместе."
+        ),
+        "share_item_text": (
+            "Смотри, какой товар я отслеживаю через @PriceSniper_tracker_bot! "
+            "Давай ловить скидку вместе: {title}\n"
+            "https://t.me/PriceSniper_tracker_bot?start=item_{item_id}"
+        ),
+        "share_bot_text": (
+            "Крутой бот для отслеживания цен и наличия товаров в интернет-магазинах! "
+            "Рекомендую: https://t.me/PriceSniper_tracker_bot"
+        ),
+        "share_bot_desc": "Поделиться ботом PriceSniper",
+        "deep_link_item_prompt": (
+            "Твой друг отслеживает этот товар! Хочешь тоже добавить его в свой список?"
+        ),
 
         # Парсинг
         "parsing_start": "🔍 <i>Снайпер изучает страницу...</i>",
@@ -216,6 +287,7 @@ TEXTS: dict[str, dict[str, str]] = {
         # Удаление
         "item_deleted":       "🗑 <i>Товар удалён из отслеживания.</i>",
         "item_deleted_popup": "Товар удалён ✓",
+        "item_added_popup":   "Товар добавлен ✓",
 
         # Ручное обновление
         "refresh_start":    "🔄 <i>Обновляю данные по вашим товарам...</i>",

@@ -107,6 +107,17 @@ async def save_item(
         return cursor.lastrowid  # type: ignore[return-value]
 
 
+async def get_item_by_id(item_id: int) -> dict | None:
+    """Возвращает товар по его id или None, если не найден."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM items WHERE id = ?", (item_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+
 async def get_user_items(user_id: int) -> list[dict]:
     """Возвращает все товары пользователя."""
     async with aiosqlite.connect(DB_PATH) as db:
