@@ -24,6 +24,7 @@ import asyncio
 import logging
 import os
 import re
+from urllib.parse import quote
 
 from aiohttp import web
 from dotenv import load_dotenv
@@ -164,8 +165,13 @@ def _lang_kb(lang: str | None = None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def _item_kb(item_id: int, url: str, lang: str) -> InlineKeyboardMarkup:
+def _item_kb(item_id: int, url: str, lang: str, title: str = "") -> InlineKeyboardMarkup:
     """Инлайн-клавиатура под карточкой товара: [🗑 Удалить] [🔗 Открыть] [📤 Поделиться]."""
+    bot_username = os.getenv("BOT_USERNAME", "PriceSniper_tracker_bot").removeprefix("@")
+    deep_link = f"https://t.me/{bot_username}?start=item_{item_id}"
+    share_text = t(lang, "share_item_text", title=title, item_id=str(item_id))
+    share_url = f"https://t.me/share/url?url={quote(deep_link)}&text={quote(share_text)}"
+
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -181,7 +187,7 @@ def _item_kb(item_id: int, url: str, lang: str) -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(
                     text=t(lang, "btn_share_item"),
-                    switch_inline_query=f"item_{item_id}",
+                    url=share_url,
                 ),
             ],
         ]
@@ -312,7 +318,7 @@ async def _send_list(target: Message, user_id: int, lang: str) -> None:
         await target.answer(
             _card_from_db(lang, item),
             parse_mode=ParseMode.HTML,
-            reply_markup=_item_kb(item["id"], item["url"], lang),
+            reply_markup=_item_kb(item["id"], item["url"], lang, item.get("title") or ""),
         )
 
 
@@ -472,7 +478,7 @@ async def cb_add_shared_item(callback: CallbackQuery) -> None:
     await callback.message.edit_text(  # type: ignore[union-attr]
         f"{_card_from_db(lang, item)}\n\n{t(lang, 'item_added')}",
         parse_mode=ParseMode.HTML,
-        reply_markup=_item_kb(new_item_id, item["url"], lang),
+        reply_markup=_item_kb(new_item_id, item["url"], lang, item.get("title") or ""),
     )
     await callback.answer(t(lang, "item_added_popup"), show_alert=False)
 
@@ -667,7 +673,7 @@ async def handle_text(message: Message) -> None:
     await status_msg.edit_text(
         _card_from_result(lang, result),
         parse_mode=ParseMode.HTML,
-        reply_markup=_item_kb(item_id, url, lang),
+        reply_markup=_item_kb(item_id, url, lang, result.title or ""),
     )
 
     # 6. Подтверждение добавления
