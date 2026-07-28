@@ -763,7 +763,12 @@ async def cb_select_variant(callback: CallbackQuery) -> None:
 
     selected_v = variants[idx]
     v_title = selected_v.get("title", "")
-    v_in_stock = bool(selected_v.get("in_stock", True))
+    if "in_stock" in selected_v:
+        v_in_stock = bool(selected_v["in_stock"])
+    elif "available" in selected_v:
+        v_in_stock = bool(selected_v["available"])
+    else:
+        v_in_stock = True
     v_price = selected_v.get("price") or pending["price"]
 
     # Формируем название с указанием выбранного размера/опции

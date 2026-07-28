@@ -855,8 +855,8 @@ def _apply_variant_info(
         title = f"{title} ({variant_label})"
 
     is_in_stock = result.is_in_stock
-    if variant_stock is False:
-        is_in_stock = False
+    if variant_stock is not None:
+        is_in_stock = variant_stock
 
     return ParseResult(
         title=title,
