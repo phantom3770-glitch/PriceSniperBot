@@ -70,6 +70,7 @@ TEXTS: dict[str, dict[str, str]] = {
             "📦 Статус: {stock_emoji} <b>{stock_label}</b>"
         ),
         "item_added": "✅ <b>Ціль додано до списку відстеження!</b>",
+        "save_error": "⚠️ <b>Помилка збереження!</b> Не вдалося зберегти товар. Спробуйте ще раз.",
 
         # Список товарів
         "list_header": "📋 <b>Ваші товари ({count} шт.):</b>",
@@ -181,6 +182,7 @@ TEXTS: dict[str, dict[str, str]] = {
             "📦 Status: {stock_emoji} <b>{stock_label}</b>"
         ),
         "item_added": "✅ <b>Target added to tracking list!</b>",
+        "save_error": "⚠️ <b>Save Error!</b> Failed to save the item. Please try again.",
 
         # Item list
         "list_header": "📋 <b>Your Items ({count}):</b>",
@@ -292,6 +294,7 @@ TEXTS: dict[str, dict[str, str]] = {
             "📦 Статус: {stock_emoji} <b>{stock_label}</b>"
         ),
         "item_added": "✅ <b>Цель добавлена в список отслеживания!</b>",
+        "save_error": "⚠️ <b>Ошибка сохранения!</b> Не удалось сохранить товар. Попробуйте еще раз.",
 
         # Список товаров
         "list_header": "📋 <b>Ваши товары ({count} шт.):</b>",

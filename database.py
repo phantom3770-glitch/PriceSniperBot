@@ -50,6 +50,7 @@ async def ensure_user(user_id: int, default_lang: str = "en") -> None:
     Гарантирует, что пользователь существует в БД.
     Если запись уже есть, её данные (включая выбор языка) не перезаписываются.
     """
+    user_id = int(user_id)
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """
@@ -63,6 +64,7 @@ async def ensure_user(user_id: int, default_lang: str = "en") -> None:
 
 async def upsert_user(user_id: int, language: str) -> None:
     """Создаёт или обновляет запись пользователя с его языком."""
+    user_id = int(user_id)
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """
@@ -76,6 +78,7 @@ async def upsert_user(user_id: int, language: str) -> None:
 
 async def get_user_language(user_id: int) -> str | None:
     """Возвращает язык пользователя из БД или None, если пользователь не найден."""
+    user_id = int(user_id)
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
             "SELECT language FROM users WHERE user_id = ?", (user_id,)
@@ -94,6 +97,7 @@ async def save_item(
     is_in_stock: bool,
 ) -> int:
     """Сохраняет товар и возвращает его id."""
+    user_id = int(user_id)
     now = datetime.now(timezone.utc).isoformat()
     async with aiosqlite.connect(DB_PATH) as db:
         cursor = await db.execute(
@@ -105,6 +109,9 @@ async def save_item(
         )
         await db.commit()
         return cursor.lastrowid  # type: ignore[return-value]
+
+# Псевдоним функции сохранения
+add_item = save_item
 
 
 async def get_item_by_id(item_id: int) -> dict | None:
@@ -120,6 +127,7 @@ async def get_item_by_id(item_id: int) -> dict | None:
 
 async def get_user_items(user_id: int) -> list[dict]:
     """Возвращает все товары пользователя."""
+    user_id = int(user_id)
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
@@ -176,6 +184,7 @@ async def delete_item(item_id: int, user_id: int) -> None:
     Удаляет товар из БД.
     Проверяет user_id для защиты от удаления чужих товаров.
     """
+    user_id = int(user_id)
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             "DELETE FROM items WHERE id = ? AND user_id = ?",

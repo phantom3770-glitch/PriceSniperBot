@@ -718,14 +718,21 @@ async def handle_text(message: Message) -> None:
         return
 
     # 5. Сохраняем → получаем item_id
-    item_id = await save_item(
-        user_id=user_id,
-        url=url,
-        title=result.title,
-        price=result.price,
-        currency=result.currency,
-        is_in_stock=result.is_in_stock,
-    )
+    try:
+        item_id = await save_item(
+            user_id=int(user_id),
+            url=url,
+            title=result.title,
+            price=result.price,
+            currency=result.currency,
+            is_in_stock=result.is_in_stock,
+        )
+    except Exception as exc:
+        logger.error("Failed to save item for user %s: %s", user_id, exc, exc_info=True)
+        await status_msg.edit_text(
+            t(lang, "save_error"), parse_mode=ParseMode.HTML
+        )
+        return
 
     # 6. Редактируем "изучаю..." → карточка + кнопки
     await status_msg.edit_text(
@@ -791,14 +798,21 @@ async def cb_select_variant(callback: CallbackQuery) -> None:
         target_url = f"{base_url}{sep}size={quote(v_title)}"
 
     # Сохраняем вариант в БД
-    item_id = await save_item(
-        user_id=user_id,
-        url=target_url,
-        title=full_title,
-        price=v_price,
-        currency=pending["currency"],
-        is_in_stock=v_in_stock,
-    )
+    try:
+        item_id = await save_item(
+            user_id=int(user_id),
+            url=target_url,
+            title=full_title,
+            price=v_price,
+            currency=pending["currency"],
+            is_in_stock=v_in_stock,
+        )
+    except Exception as exc:
+        logger.error("Failed to save variant item for user %s: %s", user_id, exc, exc_info=True)
+        await callback.message.edit_text(
+            t(lang, "save_error"), parse_mode=ParseMode.HTML
+        )
+        return
 
     result = ParseResult(
         title=full_title,
