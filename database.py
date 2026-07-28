@@ -179,6 +179,27 @@ async def update_item_data(
         await db.commit()
 
 
+async def update_item_variant(
+    item_id: int,
+    url: str,
+    title: str,
+    price: str,
+    is_in_stock: bool,
+) -> None:
+    """Обновляет URL, название, цену и наличие товара после выбора конкретного размера."""
+    item_id = int(item_id)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            UPDATE items
+            SET    url = ?, title = ?, price = ?, is_in_stock = ?
+            WHERE  id = ?
+            """,
+            (url, title, price, int(is_in_stock), item_id),
+        )
+        await db.commit()
+
+
 async def delete_item(item_id: int, user_id: int) -> None:
     """
     Удаляет товар из БД.

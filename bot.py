@@ -24,7 +24,7 @@ import asyncio
 import logging
 import os
 import re
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 from aiohttp import web
 from dotenv import load_dotenv
@@ -63,6 +63,7 @@ from database import (
     init_db,
     save_item,
     update_item_data,
+    update_item_variant,
     upsert_user,
 )
 from locales import t
@@ -107,11 +108,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-from uuid import uuid4
-
-# ── Кэш языков пользователей и ожидающих выбора вариантов ─────────────────────
+# ── Кэш языков пользователей в памяти ────────────────────────────────────────
 _lang_cache: dict[int, str] = {}
-_pending_variants: dict[str, dict] = {}
 
 # ── Регулярка для поиска URL в тексте ────────────────────────────────────────
 URL_RE = re.compile(
@@ -197,8 +195,8 @@ def _item_kb(item_id: int, url: str, lang: str, title: str = "") -> InlineKeyboa
     )
 
 
-def _variant_selector_kb(session_id: str, variants: list[dict], lang: str = "en") -> InlineKeyboardMarkup:
-    """Создаёт инлайн-кнопки выбора вариантов товара с их статусом (🟢 / 🔴)."""
+def _variant_selector_kb(item_id: int, variants: list[dict], lang: str = "en") -> InlineKeyboardMarkup:
+    """Создаёт инлайн-кнопки выбора вариантов товара на основе item_id из БД."""
     rows: list[list[InlineKeyboardButton]] = []
     current_row: list[InlineKeyboardButton] = []
 
@@ -208,20 +206,24 @@ def _variant_selector_kb(session_id: str, variants: list[dict], lang: str = "en"
         "ru": "Нет",
     }.get(lang, "Out of stock")
 
-    for idx, v in enumerate(variants):
+    for v in variants:
         in_stock = v.get("in_stock", True)
         emoji = "🟢" if in_stock else "🔴"
-        title = v.get("title", "")
+        title = str(v.get("title", "")).strip()
+        if not title:
+            continue
 
         if in_stock:
             btn_text = f"{emoji} {title}"
         else:
             btn_text = f"{emoji} {title} ({no_stock_label})"
 
+        safe_title = quote(title, safe="")
+
         current_row.append(
             InlineKeyboardButton(
                 text=btn_text,
-                callback_data=f"vsel:{session_id}:{idx}",
+                callback_data=f"sz:{item_id}:{safe_title}",
             )
         )
         if len(current_row) == 2:
@@ -699,25 +701,7 @@ async def handle_text(message: Message) -> None:
         )
         return
 
-    # 4. Если у товара есть несколько вариантов и конкретный вариант не указан в URL
-    if len(result.variants) > 1:
-        session_id = uuid4().hex[:8]
-        _pending_variants[session_id] = {
-            "user_id": user_id,
-            "url": url,
-            "base_title": result.title,
-            "price": result.price,
-            "currency": result.currency,
-            "variants": result.variants,
-        }
-        await status_msg.edit_text(
-            t(lang, "select_variant_prompt"),
-            parse_mode=ParseMode.HTML,
-            reply_markup=_variant_selector_kb(session_id, result.variants, lang),
-        )
-        return
-
-    # 5. Сохраняем → получаем item_id
+    # 4. Сохраняем базовый товар в БД → получаем item_id
     try:
         item_id = await save_item(
             user_id=int(user_id),
@@ -734,7 +718,16 @@ async def handle_text(message: Message) -> None:
         )
         return
 
-    # 6. Редактируем "изучаю..." → карточка + кнопки
+    # 5. Если у товара несколько вариантов — выводим инлайн-клавиатуру выбора
+    if len(result.variants) > 1:
+        await status_msg.edit_text(
+            t(lang, "select_variant_prompt"),
+            parse_mode=ParseMode.HTML,
+            reply_markup=_variant_selector_kb(item_id, result.variants, lang),
+        )
+        return
+
+    # 6. Если вариант один — выводим готовую карточку товара
     await status_msg.edit_text(
         _card_from_result(lang, result),
         parse_mode=ParseMode.HTML,
@@ -745,96 +738,74 @@ async def handle_text(message: Message) -> None:
     await message.answer(t(lang, "item_added"), parse_mode=ParseMode.HTML)
 
 
-# ── Callback: выбор конкретного варианта/размера ─────────────────────────────
-@router.callback_query(F.data.startswith("vsel:"))
-async def cb_select_variant(callback: CallbackQuery) -> None:
+# ── Callback: обработка выбора размера на основе item_id из БД ───────────────
+@router.callback_query(F.data.startswith("sz:"))
+async def cb_select_size(callback: CallbackQuery) -> None:
     parts = callback.data.split(":")  # type: ignore[union-attr]
     if len(parts) < 3:
         await callback.answer()
         return
 
-    session_id = parts[1]
-    idx = int(parts[2])
+    item_id = int(parts[1])
+    size_name = unquote(parts[2])
     user_id = callback.from_user.id
     lang = await _get_lang(user_id) or "en"
 
-    pending = _pending_variants.pop(session_id, None)
-    if not pending:
-        await callback.answer("Expired / Вже вибрано", show_alert=True)
+    # Ответ на callback сразу
+    await callback.answer()
+
+    # 1. Извлекаем созданный товар из SQLite
+    item = await get_item_by_id(item_id)
+    if not item:
+        await callback.message.edit_text(t(lang, "parse_error"), parse_mode=ParseMode.HTML)  # type: ignore[union-attr]
         return
 
-    variants = pending.get("variants", [])
-    if idx >= len(variants):
-        await callback.answer("Variant not found", show_alert=True)
-        return
-
-    selected_v = variants[idx]
-    v_title = selected_v.get("title", "")
-    if "in_stock" in selected_v:
-        v_in_stock = bool(selected_v["in_stock"])
-    elif "available" in selected_v:
-        v_in_stock = bool(selected_v["available"])
-    else:
-        v_in_stock = True
-    v_price = selected_v.get("price") or pending["price"]
-
-    # Формируем название с указанием выбранного размера/опции
-    size_pattern = re.compile(r"^(XXS|XS|S|M|L|XL|XXL|3XL|4XL|5XL|[2-5]?XL|\d{2,3})$", re.IGNORECASE)
-    variant_label = f"Размер: {v_title}" if size_pattern.match(v_title) else f"Вариант: {v_title}"
-
-    base_title = pending["base_title"]
-    if variant_label not in base_title:
-        full_title = f"{base_title} ({variant_label})"
-    else:
-        full_title = base_title
-
-    # Создаём целевой URL с параметром варианта
-    base_url = pending["url"]
-    v_id = selected_v.get("id") or v_title
+    # 2. Формируем целевую ссылку с параметром размера и перепарсиваем
+    base_url = item["url"]
     sep = "&" if "?" in base_url else "?"
-    if v_id.isdigit():
-        target_url = f"{base_url}{sep}variant={v_id}"
-    else:
-        target_url = f"{base_url}{sep}size={quote(v_title)}"
+    size_url = f"{base_url}{sep}size={quote(size_name)}"
 
-    # Сохраняем вариант в БД
-    try:
-        item_id = await save_item(
-            user_id=int(user_id),
-            url=target_url,
-            title=full_title,
-            price=v_price,
-            currency=pending["currency"],
-            is_in_stock=v_in_stock,
-        )
-    except Exception as exc:
-        logger.error("Failed to save variant item for user %s: %s", user_id, exc, exc_info=True)
-        await callback.message.edit_text(
-            t(lang, "save_error"), parse_mode=ParseMode.HTML
-        )
-        return
+    parsed = await parse_product(size_url)
+
+    # 3. Формируем название с понятной меткой размера
+    size_pattern = re.compile(r"^(XXS|XS|S|M|L|XL|XXL|3XL|4XL|5XL|[2-5]?XL|\d{2,3})$", re.IGNORECASE)
+    variant_label = f"Размер: {size_name}" if size_pattern.match(size_name) else f"Вариант: {size_name}"
+
+    raw_title = item.get("title") or parsed.title or ""
+    clean_base_title = re.sub(r"\s*\((?:Размер|Вариант|Розмір):[^)]*\)", "", raw_title, flags=re.IGNORECASE).strip()
+    full_title = f"{clean_base_title} ({variant_label})"
+
+    price = parsed.price or item.get("price") or ""
+
+    # 4. Сохраняем обновленные параметры в SQLite
+    await update_item_variant(
+        item_id=item_id,
+        url=size_url,
+        title=full_title,
+        price=price,
+        is_in_stock=parsed.is_in_stock,
+    )
 
     result = ParseResult(
         title=full_title,
-        price=v_price,
-        currency=pending["currency"],
-        is_in_stock=v_in_stock,
+        price=price,
+        currency=parsed.currency or item.get("currency") or "₴",
+        is_in_stock=parsed.is_in_stock,
         source="variant_selector",
     )
 
-    # Редактируем сообщение со списком вариантов → превращаем в карточку товара
+    # 5. Превращаем меню выбора вариантов в итоговую карточку товара
     await callback.message.edit_text(  # type: ignore[union-attr]
         _card_from_result(lang, result),
         parse_mode=ParseMode.HTML,
-        reply_markup=_item_kb(item_id, target_url, lang, full_title),
+        reply_markup=_item_kb(item_id, size_url, lang, full_title),
     )
 
-    # Отправляем подтверждение пользователю
+    # 6. Отправляем пользователю сообщение-подтверждение
     await callback.message.answer(  # type: ignore[union-attr]
-        t(lang, "variant_target_added", variant=v_title),
+        t(lang, "variant_target_added", variant=size_name),
         parse_mode=ParseMode.HTML,
     )
-    await callback.answer(t(lang, "item_added_popup"), show_alert=False)
 
 
 # ── Точка входа ───────────────────────────────────────────────────────────────
