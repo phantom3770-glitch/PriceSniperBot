@@ -197,25 +197,40 @@ def _item_kb(item_id: int, url: str, lang: str, title: str = "") -> InlineKeyboa
     )
 
 
-def _variant_selector_kb(session_id: str, variants: list[dict]) -> InlineKeyboardMarkup:
+def _variant_selector_kb(session_id: str, variants: list[dict], lang: str = "en") -> InlineKeyboardMarkup:
     """Создаёт инлайн-кнопки выбора вариантов товара с их статусом (🟢 / 🔴)."""
     rows: list[list[InlineKeyboardButton]] = []
     current_row: list[InlineKeyboardButton] = []
+
+    no_stock_label = {
+        "uk": "Немає",
+        "en": "Out of stock",
+        "ru": "Нет",
+    }.get(lang, "Out of stock")
+
     for idx, v in enumerate(variants):
-        emoji = "🟢" if v.get("in_stock", True) else "🔴"
+        in_stock = v.get("in_stock", True)
+        emoji = "🟢" if in_stock else "🔴"
         title = v.get("title", "")
-        btn_text = f"{emoji} {title}"
+
+        if in_stock:
+            btn_text = f"{emoji} {title}"
+        else:
+            btn_text = f"{emoji} {title} ({no_stock_label})"
+
         current_row.append(
             InlineKeyboardButton(
                 text=btn_text,
                 callback_data=f"vsel:{session_id}:{idx}",
             )
         )
-        if len(current_row) == 3:
+        if len(current_row) == 2:
             rows.append(current_row)
             current_row = []
+
     if current_row:
         rows.append(current_row)
+
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -698,7 +713,7 @@ async def handle_text(message: Message) -> None:
         await status_msg.edit_text(
             t(lang, "select_variant_prompt"),
             parse_mode=ParseMode.HTML,
-            reply_markup=_variant_selector_kb(session_id, result.variants),
+            reply_markup=_variant_selector_kb(session_id, result.variants, lang),
         )
         return
 

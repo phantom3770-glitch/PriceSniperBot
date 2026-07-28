@@ -2,7 +2,8 @@
 parser.py — асинхронный парсер товарных страниц.
 
 Стратегия (каскад):
-  1. JSON-LD (schema.org Product) — наиболее точный источник
+  0. Shopify JSON API (/products/*.json) — прямой доступ к метаданным вариантов
+  1. JSON-LD (schema.org Product) — наиболее точный микроразметочный источник
   2. Open Graph + CSS-селекторы цены + itemprop / наличие вариаций
   3. Фолбэк → Gemini API (анализирует HTML с расширенной инструкцией наличия)
 """
@@ -51,7 +52,7 @@ class ParseResult:
     price: str        # строка: "1 299.00"
     currency: str     # символ или код: "₴", "USD"
     is_in_stock: bool
-    source: str       # "jsonld" | "css" | "gemini" | "error"
+    source: str       # "shopify_json" | "jsonld" | "css" | "gemini" | "error"
     variants: list[dict] = field(default_factory=list)
 
 
@@ -89,6 +90,14 @@ async def parse_product(url: str) -> ParseResult:
     Всегда возвращает ParseResult — даже при ошибке (source='error').
     """
     target_url = clean_url(url)
+
+    # 0. Прямой запрос к Shopify JSON API (/products/*.json)
+    shopify_res = await _parse_shopify_json(target_url)
+    if shopify_res:
+        logger.info("Parsed via Shopify JSON API: %s | variants count: %d", target_url, len(shopify_res.variants))
+        return shopify_res
+
+    # 1. Загрузка HTML
     try:
         html = await _fetch(target_url)
     except httpx.HTTPStatusError as exc:
@@ -117,6 +126,110 @@ async def parse_product(url: str) -> ParseResult:
     logger.info("Falling back to Gemini for: %s", target_url)
     gemini_result = await _parse_gemini(target_url, html, json_snippet)
     return _apply_variant_info(gemini_result, soup, target_url, embedded_variants)
+
+
+# ── Shopify JSON API (/products/<handle>.json) ────────────────────────────────
+async def _parse_shopify_json(url: str) -> ParseResult | None:
+    """
+    Прямой запрос к Shopify JSON API.
+    Подходит для сайтов peresvitbrand.com и любых других магазинов на Shopify.
+    """
+    try:
+        parsed = urlparse(url)
+        path = parsed.path
+        if "/products/" not in path:
+            return None
+
+        clean_path = path.rstrip("/")
+        if clean_path.endswith(".json"):
+            json_path = clean_path
+        else:
+            json_path = f"{clean_path}.json"
+
+        json_url = f"{parsed.scheme}://{parsed.netloc}{json_path}"
+        logger.info("[Shopify API] GET %s", json_url)
+
+        async with httpx.AsyncClient(headers=_HEADERS, follow_redirects=True, timeout=10.0) as client:
+            resp = await client.get(json_url)
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+
+        product = data.get("product")
+        if not isinstance(product, dict):
+            return None
+
+        base_title = str(product.get("title") or "").strip()
+        if not base_title:
+            return None
+
+        raw_variants = product.get("variants", [])
+        variants_list = []
+        size_pattern = re.compile(r"^(XXS|XS|S|M|L|XL|XXL|3XL|4XL|5XL|[2-5]?XL|\d{2,3})$", re.IGNORECASE)
+
+        for v in raw_variants:
+            v_id = str(v.get("id") or "").strip()
+            v_title = str(v.get("title") or v.get("option1") or "").strip()
+            v_available = bool(v.get("available", True))
+            v_price = str(v.get("price") or "").strip()
+            if "." in v_price:
+                v_price = v_price.rstrip("0").rstrip(".")
+
+            if v_title:
+                variants_list.append({
+                    "id": v_id,
+                    "title": v_title,
+                    "in_stock": v_available,
+                    "price": v_price
+                })
+
+        currency = "₴" if any(domain in parsed.netloc for domain in [".ua", "peresvit", "ukraine"]) else "$"
+
+        query_params = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        target_variant_id = query_params.get("variant") or query_params.get("variant_id") or query_params.get("v")
+        target_size = query_params.get("size") or query_params.get("sz") or query_params.get("option")
+
+        matched_v = None
+        if target_variant_id:
+            for v in variants_list:
+                if v["id"] == str(target_variant_id).strip():
+                    matched_v = v
+                    break
+
+        if not matched_v and target_size:
+            target_clean = str(target_size).strip().lower()
+            for v in variants_list:
+                if v["title"].lower() == target_clean or f"/{target_clean}" in v["title"].lower() or f"{target_clean} " in v["title"].lower():
+                    matched_v = v
+                    break
+
+        if matched_v:
+            v_title = matched_v["title"]
+            variant_label = f"Размер: {v_title}" if size_pattern.match(v_title) else f"Вариант: {v_title}"
+            full_title = f"{base_title} ({variant_label})"
+            return ParseResult(
+                title=full_title,
+                price=matched_v["price"],
+                currency=currency,
+                is_in_stock=matched_v["in_stock"],
+                source="shopify_json",
+                variants=[],
+            )
+
+        first_price = variants_list[0]["price"] if variants_list else ""
+        overall_in_stock = any(v["in_stock"] for v in variants_list)
+
+        return ParseResult(
+            title=base_title,
+            price=first_price,
+            currency=currency,
+            is_in_stock=overall_in_stock,
+            source="shopify_json",
+            variants=variants_list,
+        )
+    except Exception as exc:
+        logger.warning("[Shopify API] Error parsing %s: %s", url, exc)
+        return None
 
 
 # ── Шаг 1: JSON-LD ────────────────────────────────────────────────────────────
@@ -158,7 +271,6 @@ def _parse_jsonld(soup: BeautifulSoup) -> ParseResult | None:
 
 # ── Шаг 2: CSS / itemprop / Open Graph ───────────────────────────────────────
 def _parse_css(soup: BeautifulSoup, url: str = "", embedded_variants: list[dict] | None = None) -> ParseResult | None:
-    # --- Название ---
     title = ""
     if (og := soup.find("meta", property="og:title")):
         title = og.get("content", "").strip()
@@ -167,10 +279,7 @@ def _parse_css(soup: BeautifulSoup, url: str = "", embedded_variants: list[dict]
     if not title and (tag := soup.title):
         title = tag.get_text(strip=True)
 
-    # --- Цена ---
     price, currency = _extract_price(soup)
-
-    # --- Наличие ---
     is_in_stock = _extract_availability(soup, url, embedded_variants)
 
     if title and price:
@@ -200,7 +309,6 @@ def _extract_price(soup: BeautifulSoup) -> tuple[str, str]:
         el = soup.select_one(sel)
         if not el:
             continue
-        # Приоритет: content / data-price → текст элемента
         raw = (
             el.get("content")
             or el.get("data-price")
@@ -224,13 +332,11 @@ def _extract_availability(soup: BeautifulSoup, url: str = "", embedded_variants:
     """
     Продвинутое определение наличия товара с учетом конкретно выбранной вариации и активных кнопок.
     """
-    # 0. Проверка наличия для конкретного варианта (если URL/HTML/JSON содержит информацию о варианте)
     if url or embedded_variants:
         _, variant_stock, _ = _detect_variant_and_stock(soup, url, embedded_variants)
         if variant_stock is not None:
             return variant_stock
 
-    # 1. Проверка микроразметки schema.org
     avail = soup.find(attrs={"itemprop": "availability"})
     if avail:
         content = (avail.get("content", "") + avail.get_text()).lower()
@@ -239,7 +345,6 @@ def _extract_availability(soup: BeautifulSoup, url: str = "", embedded_variants:
         if "outofstock" in content:
             return False
 
-    # 2. Поиск активных кнопок покупки ('Купити', 'У кошик', 'В корзину', 'Buy')
     buy_buttons = soup.select(
         "button[type='submit'], input[type='submit'], .btn-buy, .buy-button, "
         "[class*='add-to-cart'], [class*='add_to_cart'], [id*='add-to-cart'], "
@@ -259,7 +364,6 @@ def _extract_availability(soup: BeautifulSoup, url: str = "", embedded_variants:
         if not is_btn_disabled and any(kw in btn_text for kw in ["купити", "у кошик", "в корзину", "buy", "додати", "заказать", "купить"]):
             return True
 
-    # 3. Наличие выбранного <option> в выпадающем списке
     selects = soup.find_all("select")
     for select in selects:
         selected_opt = select.find("option", selected=True)
@@ -268,7 +372,6 @@ def _extract_availability(soup: BeautifulSoup, url: str = "", embedded_variants:
             if val and not any(dis in val for dis in ["немає", "нет", "out of stock", "disabled", "розпродано"]):
                 return True
 
-    # 4. Текстовые ключевые слова
     text = soup.get_text(" ", strip=True).lower()
     in_stock_kw = ["в наявності", "є в наявності", "в наличии", "in stock", "available"]
     out_stock_kw = ["немає в наявності", "нет в наличии", "out of stock", "not available", "закінчився", "розпродано"]
@@ -281,7 +384,6 @@ def _extract_availability(soup: BeautifulSoup, url: str = "", embedded_variants:
     if any(w in text for w in in_stock_kw):
         return True
 
-    # Если есть активная кнопка покупки
     for btn in buy_buttons:
         btn_text = btn.get_text(strip=True).lower()
         if btn.get("disabled") is None and not any(w in btn_text for w in out_stock_words):
@@ -305,7 +407,6 @@ def _extract_embedded_variants(soup: BeautifulSoup | None) -> tuple[list[dict], 
     if not soup:
         return variants, ""
 
-    # 1. Поиск тегов <script>
     for script in soup.find_all("script"):
         stype = (script.get("type") or "").lower()
         sid = (script.get("id") or "").lower()
@@ -313,7 +414,6 @@ def _extract_embedded_variants(soup: BeautifulSoup | None) -> tuple[list[dict], 
         if not stext:
             continue
 
-        # Shopify ProductJson или type="application/json"
         if stype == "application/json" or "product" in sid or "variant" in sid:
             try:
                 data = json.loads(stext)
@@ -335,7 +435,6 @@ def _extract_embedded_variants(soup: BeautifulSoup | None) -> tuple[list[dict], 
             except Exception:
                 pass
 
-        # LD+JSON
         if stype == "application/ld+json":
             try:
                 data = json.loads(stext)
@@ -361,7 +460,6 @@ def _extract_embedded_variants(soup: BeautifulSoup | None) -> tuple[list[dict], 
             except Exception:
                 pass
 
-        # JS-переменные: var meta = ..., var product = ..., window.ShopifyAnalytics...
         if not stype or stype in {"text/javascript", "application/javascript"}:
             var_matches = re.findall(r'"variants"\s*:\s*(\[\s*\{.*?\}\s*\])', stext, re.DOTALL)
             for m in var_matches:
@@ -376,7 +474,6 @@ def _extract_embedded_variants(soup: BeautifulSoup | None) -> tuple[list[dict], 
                 except Exception:
                     pass
 
-    # 2. Поиск атрибута data-product_variations (WooCommerce / Custom)
     for el in soup.select("[data-product_variations], [data-product-json]"):
         attr_val = el.get("data-product_variations") or el.get("data-product-json")
         if attr_val:
@@ -397,7 +494,6 @@ def _extract_embedded_variants(soup: BeautifulSoup | None) -> tuple[list[dict], 
             except Exception:
                 pass
 
-    # Убираем дубликаты
     unique_variants = []
     seen = set()
     for v in variants:
@@ -494,7 +590,6 @@ def _detect_variant_and_stock(
                     "price": str(v.get("price") or "").strip()
                 })
 
-    # 1. Анализ параметров URL (variant=, size=, sku=, color=)
     if url:
         try:
             parsed_url = urlparse(url)
@@ -532,7 +627,6 @@ def _detect_variant_and_stock(
         except Exception as exc:
             logger.warning("Could not parse URL query for variants: %s", exc)
 
-    # 2. Если есть встроенные JSON-данные вариантов — сопоставляем с выбранным вариантом
     if embedded_variants:
         target_term = (variant_name or "").strip().lower()
         matched_v = None
@@ -564,7 +658,6 @@ def _detect_variant_and_stock(
                 variant_label = f"Вариант: {clean_title}"
             return variant_label, matched_v["available"], []
 
-        # Если в URL не был указан конкретный вариант
         if not target_term and embedded_variants:
             avail_sizes = [v["title"] for v in embedded_variants if v["available"]]
             oos_sizes = [v["title"] for v in embedded_variants if not v["available"]]
@@ -579,8 +672,32 @@ def _detect_variant_and_stock(
             elif avail_sizes:
                 return None, True, all_variants
 
-    # 3. Анализ HTML (элементы selected, active, checked, aria-checked="true", selected <option>, SKU)
     if not all_variants and soup:
+        # 1. Поиск элементов выбора вариантов (.variant-item, .size-item, .swatch-element) в контейнере товара
+        product_box = soup.select_one("form[action*='cart'], [class*='product-detail'], [class*='product-info'], [class*='product-single'], main, #main") or soup
+        variant_elements = product_box.select(".variant-item, [class*='variant-item'], [class*='size-item'], [class*='swatch-element'], .size-swatch, .variant-option")
+        for el in variant_elements:
+            t_clean = el.get_text(strip=True)
+            if not t_clean or len(t_clean) > 25:
+                continue
+            classes = [c.lower() for c in el.get("class", [])]
+            is_disabled = (
+                el.get("disabled") is not None
+                or el.get("aria-disabled") == "true"
+                or any(d in classes for d in ["disabled", "is-disabled", "out-of-stock", "sold-out", "unavailable", "no-stock", "cross"])
+            )
+            clean_name = re.sub(r"\s*\((?:немає|нет|out of stock|розпродано)[^)]*\)", "", t_clean, flags=re.IGNORECASE).strip()
+            key = clean_name.lower()
+            if clean_name and key not in seen_variants:
+                seen_variants.add(key)
+                all_variants.append({
+                    "id": el.get("data-value") or el.get("data-id") or clean_name,
+                    "title": clean_name,
+                    "in_stock": not is_disabled,
+                    "price": ""
+                })
+
+        # 2. Поиск <option> в выпадающих списках <select>
         for select in soup.find_all("select"):
             for opt in select.find_all("option"):
                 opt_text = opt.get_text(strip=True)
@@ -603,7 +720,6 @@ def _detect_variant_and_stock(
                         })
 
     if not variant_label and soup:
-        # 3a. <option selected> в выпадающих списках <select>
         for select in soup.find_all("select"):
             selected_opt = select.find("option", selected=True)
             if not selected_opt:
@@ -631,7 +747,6 @@ def _detect_variant_and_stock(
                     break
 
     if not variant_label and soup:
-        # 3b. Активные элементы с классами selected, active, checked, aria-checked="true"
         active_selectors = [
             ".selected", ".active", ".checked",
             "[aria-checked='true']", "[data-selected='true']",
@@ -674,7 +789,6 @@ def _detect_variant_and_stock(
                 break
 
     if not variant_label and soup:
-        # 3c. Поиск артикула вида 501273-942-M
         sku_el = soup.find(text=sku_pattern) or soup.select_one("[class*='sku'], [id*='sku']")
         if sku_el:
             sku_text = sku_el.get_text(strip=True) if hasattr(sku_el, "get_text") else str(sku_el)
@@ -685,7 +799,6 @@ def _detect_variant_and_stock(
                     variant_name = extracted
                     variant_label = f"Размер: {extracted}"
 
-    # 4. Наличие для этого варианта
     if variant_disabled:
         return variant_label, False, all_variants
 
