@@ -104,6 +104,10 @@ TEXTS: dict[str, dict[str, str]] = {
             "✅ <b>Ціль додано до списку відстеження!</b>\n"
             "Повідомимо, коли розмір <b>{variant}</b> з'явиться в наявності."
         ),
+        "variant_added_in_stock": (
+            "✅ <b>Ціль додано до списку відстеження!</b>\n"
+            "Розмір <b>{variant}</b> — в наявності. Повідомимо при зміні ціни."
+        ),
         "price_drop": (
             "🔥 <b>Снайпер зафіксував знижку!</b>\n\n"
             "📌 {title}\n"
@@ -216,6 +220,10 @@ TEXTS: dict[str, dict[str, str]] = {
             "✅ <b>Target added to tracking list!</b>\n"
             "We will notify you when size <b>{variant}</b> is in stock."
         ),
+        "variant_added_in_stock": (
+            "✅ <b>Target added to tracking list!</b>\n"
+            "Size <b>{variant}</b> is available. We'll notify you on price changes."
+        ),
         "price_drop": (
             "🔥 <b>Sniper spotted a price drop!</b>\n\n"
             "📌 {title}\n"
@@ -327,6 +335,10 @@ TEXTS: dict[str, dict[str, str]] = {
         "variant_target_added": (
             "✅ <b>Цель добавлена в список отслеживания!</b>\n"
             "Уведомим, когда размер <b>{variant}</b> появится в наличии."
+        ),
+        "variant_added_in_stock": (
+            "✅ <b>Цель добавлена в список отслеживания!</b>\n"
+            "Размер <b>{variant}</b> в наличии. Уведомим при изменении цены."
         ),
         "price_drop": (
             "🔥 <b>Снайпер зафиксировал скидку!</b>\n\n"

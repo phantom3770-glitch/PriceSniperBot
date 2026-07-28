@@ -658,6 +658,45 @@ async def inline_query_handler(query: InlineQuery) -> None:
     await query.answer(results, cache_time=1, is_personal=True)
 
 
+# ── /debug — диагностика БД (только для ADMIN_ID) ────────────────────────────
+@router.message(Command("debug"))
+async def cmd_debug(message: Message) -> None:
+    user_id = message.from_user.id  # type: ignore[union-attr]
+    if ADMIN_ID and user_id != ADMIN_ID:
+        return  # Игнорируем для не-администраторов
+
+    from database import DB_PATH
+    import os
+
+    items = await get_user_items(user_id)
+    all_items_raw: list[dict] = []
+    try:
+        import aiosqlite
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT id, user_id, title FROM items LIMIT 20") as cur:
+                rows = await cur.fetchall()
+                all_items_raw = [dict(r) for r in rows]
+    except Exception as exc:
+        all_items_raw = [{"error": str(exc)}]
+
+    db_exists = os.path.isfile(DB_PATH)
+    db_size = os.path.getsize(DB_PATH) if db_exists else 0
+
+    lines = [
+        f"<b>🔧 Debug Info</b>",
+        f"user_id: <code>{user_id}</code>",
+        f"DB path: <code>{DB_PATH}</code>",
+        f"DB exists: {db_exists} ({db_size} bytes)",
+        f"Your items: <b>{len(items)}</b>",
+        f"All items in DB: <b>{len(all_items_raw)}</b>",
+    ]
+    for i in all_items_raw[:10]:
+        lines.append(f"  • id={i.get('id')} user={i.get('user_id')} {str(i.get('title',''))[:40]}")
+
+    await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
 # ── Обработчик URL (текстовые сообщения) ─────────────────────────────────────
 @router.message(F.text)
 async def handle_text(message: Message) -> None:
@@ -822,9 +861,10 @@ async def cb_select_size(callback: CallbackQuery) -> None:
             reply_markup=_item_kb(item_id, size_url, lang, full_title),
         )
 
-        # 7. Подтверждение пользователю
+        # 7. Подтверждение пользователю — разное сообщение в зависимости от наличия
+        confirm_key = "variant_added_in_stock" if is_in_stock else "variant_target_added"
         await callback.message.answer(  # type: ignore[union-attr]
-            t(lang, "variant_target_added", variant=size_name),
+            t(lang, confirm_key, variant=size_name),
             parse_mode=ParseMode.HTML,
         )
 

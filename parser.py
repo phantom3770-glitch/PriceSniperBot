@@ -94,7 +94,21 @@ async def parse_product(url: str) -> ParseResult:
     # 0. Прямой запрос к Shopify JSON API (/products/*.json)
     shopify_res = await _parse_shopify_json(target_url)
     if shopify_res:
-        logger.info("Parsed via Shopify JSON API: %s | variants count: %d", target_url, len(shopify_res.variants))
+        # Если вернулись варианты — перекрёстно проверяем с HTML страницы.
+        # Это отфильтровывает "фантомные" варианты (XS, XXL), которые есть в
+        # Shopify-бэкенде, но скрыты темой магазина, и корректирует статус
+        # наличия по визуальным маркерам "Розпродано" / "Sold out" в HTML.
+        if shopify_res.variants:
+            try:
+                html = await _fetch(target_url)
+                soup = BeautifulSoup(html, "html.parser")
+                shopify_res = _filter_shopify_variants_by_html(shopify_res, soup)
+            except Exception as exc:
+                logger.warning("[Shopify] HTML cross-ref failed, using API data as-is: %s", exc)
+        logger.info(
+            "Parsed via Shopify JSON API: %s | visible variants: %d",
+            target_url, len(shopify_res.variants)
+        )
         return shopify_res
 
     # 1. Загрузка HTML
@@ -126,6 +140,135 @@ async def parse_product(url: str) -> ParseResult:
     logger.info("Falling back to Gemini for: %s", target_url)
     gemini_result = await _parse_gemini(target_url, html, json_snippet)
     return _apply_variant_info(gemini_result, soup, target_url, embedded_variants)
+
+
+# ── Фильтрация вариантов Shopify по видимым элементам HTML ───────────────────
+def _filter_shopify_variants_by_html(result: ParseResult, soup: BeautifulSoup) -> ParseResult:
+    """
+    Перекрёстная проверка вариантов Shopify JSON с HTML-разметкой страницы.
+
+    Решает две проблемы:
+    1. Phantom variants — Shopify хранит XS/XXL в бэкенде, но тема их скрывает.
+       Функция собирает только ВИДИМЫЕ кнопки размеров из HTML и отфильтровывает
+       варианты, которых в HTML нет.
+    2. Sold-out override — Shopify API может отдавать available=true, когда на сайте
+       кнопка уже имеет класс "sold-out" / "disabled" / зачёркнута. HTML-состояние
+       считается приоритетным.
+
+    Возвращает исходный result без изменений, если в HTML не найдено ни одного
+    видимого элемента выбора размера.
+    """
+    # Словарь: title_lower -> is_sold_out (bool)
+    visible: dict[str, bool] = {}
+
+    # ── Стратегия 1: radio-inputs с name="Size" / "option[0]" и т.д. ─────────
+    for inp in soup.find_all("input", type="radio"):
+        name_attr = (inp.get("name") or "").lower()
+        if not any(k in name_attr for k in ["size", "option", "variant"]):
+            continue
+        val = (inp.get("value") or "").strip()
+        if not val or len(val) > 30:
+            continue
+        # Скрытые radio — пропускаем
+        style = (inp.get("style") or "").replace(" ", "").lower()
+        if "display:none" in style or inp.get("hidden") is not None:
+            continue
+
+        is_disabled = inp.get("disabled") is not None
+        # Проверяем родительский label/div на классы sold-out
+        parent = inp.parent
+        if parent and hasattr(parent, "get"):
+            p_classes = " ".join(parent.get("class", [])).lower()
+            if any(c in p_classes for c in [
+                "sold-out", "soldout", "is-unavailable", "unavailable",
+                "disabled", "is-disabled", "no-stock", "out-of-stock"
+            ]):
+                is_disabled = True
+            p_style = (parent.get("style") or "").replace(" ", "").lower()
+            if "display:none" in p_style or "line-through" in p_style:
+                continue  # скрытый шаблон — пропускаем целиком
+
+        visible[val.lower()] = is_disabled
+
+    # ── Стратегия 2: label/span с data-val или data-value ────────────────────
+    if not visible:
+        for el in soup.select("[data-val], [data-value]"):
+            val = (el.get("data-val") or el.get("data-value") or "").strip()
+            if not val or len(val) > 30:
+                continue
+            # Фильтруем скрытые элементы
+            style = (el.get("style") or "").replace(" ", "").lower()
+            if "display:none" in style or el.get("hidden") is not None:
+                continue
+            parent = el.parent
+            if parent and hasattr(parent, "get"):
+                p_style = (parent.get("style") or "").replace(" ", "").lower()
+                if "display:none" in p_style:
+                    continue
+
+            classes = " ".join(el.get("class", [])).lower()
+            is_disabled = (
+                el.get("disabled") is not None
+                or any(c in classes for c in [
+                    "sold-out", "soldout", "unavailable", "disabled",
+                    "is-disabled", "no-stock", "out-of-stock"
+                ])
+            )
+            visible[val.lower()] = is_disabled
+
+    # ── Стратегия 3: видимые <option> в <select name*=size/option> ───────────
+    if not visible:
+        for sel in soup.find_all("select"):
+            name_attr = (sel.get("name") or "").lower()
+            if not any(k in name_attr for k in ["size", "option", "variant"]):
+                continue
+            sel_style = (sel.get("style") or "").replace(" ", "").lower()
+            if "display:none" in sel_style or sel.get("hidden") is not None:
+                continue
+            for opt in sel.find_all("option"):
+                val = (opt.get("value") or opt.get_text(strip=True)).strip()
+                if not val or len(val) > 30:
+                    continue
+                if any(p in val.lower() for p in ["вибер", "choose", "select", "оберіть"]):
+                    continue
+                is_disabled = opt.get("disabled") is not None
+                visible[val.lower()] = is_disabled
+
+    if not visible:
+        # HTML не дал нам список размеров — возвращаем данные API без изменений
+        logger.debug("[Shopify filter] No visible size elements found in HTML, using API data as-is")
+        return result
+
+    # ── Фильтрация и коррекция статуса ────────────────────────────────────────
+    filtered: list[dict] = []
+    for v in result.variants:
+        key = v["title"].lower()
+        if key not in visible:
+            logger.debug("[Shopify filter] Dropping phantom variant '%s' (not in HTML)", v["title"])
+            continue
+        v_copy = dict(v)
+        if visible[key]:  # HTML говорит: sold-out
+            v_copy["in_stock"] = False
+        filtered.append(v_copy)
+
+    if not filtered:
+        # После фильтрации ничего не осталось — скорее всего HTML не совпал.
+        # Безопасный откат: возвращаем оригинал
+        logger.warning("[Shopify filter] All variants filtered out, falling back to API data")
+        return result
+
+    logger.info(
+        "[Shopify filter] %d → %d variants after HTML cross-ref (visible: %s)",
+        len(result.variants), len(filtered), list(visible.keys())
+    )
+    return ParseResult(
+        title=result.title,
+        price=filtered[0]["price"] or result.price,
+        currency=result.currency,
+        is_in_stock=any(v["in_stock"] for v in filtered),
+        source=result.source,
+        variants=filtered,
+    )
 
 
 # ── Shopify JSON API (/products/<handle>.json) ────────────────────────────────
