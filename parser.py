@@ -142,130 +142,151 @@ async def parse_product(url: str) -> ParseResult:
     return _apply_variant_info(gemini_result, soup, target_url, embedded_variants)
 
 
+
 # ── Фильтрация вариантов Shopify по видимым элементам HTML ───────────────────
 def _filter_shopify_variants_by_html(result: ParseResult, soup: BeautifulSoup) -> ParseResult:
     """
     Перекрёстная проверка вариантов Shopify JSON с HTML-разметкой страницы.
 
-    Решает две проблемы:
-    1. Phantom variants — Shopify хранит XS/XXL в бэкенде, но тема их скрывает.
-       Функция собирает только ВИДИМЫЕ кнопки размеров из HTML и отфильтровывает
-       варианты, которых в HTML нет.
-    2. Sold-out override — Shopify API может отдавать available=true, когда на сайте
-       кнопка уже имеет класс "sold-out" / "disabled" / зачёркнута. HTML-состояние
-       считается приоритетным.
-
-    Возвращает исходный result без изменений, если в HTML не найдено ни одного
-    видимого элемента выбора размера.
+    Стратегии (в порядке приоритета):
+    0. Peresvit/custom-тема: div.variant-block[title] + active-block/inactive-block
+    1. Radio inputs с name, содержащим size/option/variant
+    2. [data-val] / [data-value] элементы
+    3. <select name*=size/option>
     """
-    # Словарь: title_lower -> is_sold_out (bool)
-    visible: dict[str, bool] = {}
+    visible: dict[str, bool] = {}   # title_lower -> is_sold_out
+    prices:  dict[str, str]  = {}   # title_lower -> price string
 
-    # ── Стратегия 1: radio-inputs с name="Size" / "option[0]" и т.д. ─────────
-    for inp in soup.find_all("input", type="radio"):
-        name_attr = (inp.get("name") or "").lower()
-        if not any(k in name_attr for k in ["size", "option", "variant"]):
+    # ── Стратегия 0: div.variant-block[title] (Peresvit и аналогичные темы) ──
+    # <div class="variant-block text active-block"   title="XL" data-count="11.00">
+    # <div class="variant-block text inactive-block" title="M"  data-count="0.00">
+    for el in soup.find_all("div", class_="variant-block"):
+        title_attr = (el.get("title") or el.get_text(strip=True)).strip()
+        if not title_attr or len(title_attr) > 30:
             continue
-        val = (inp.get("value") or "").strip()
-        if not val or len(val) > 30:
-            continue
-        # Скрытые radio — пропускаем
-        style = (inp.get("style") or "").replace(" ", "").lower()
-        if "display:none" in style or inp.get("hidden") is not None:
+        style = (el.get("style") or "").replace(" ", "").lower()
+        if "display:none" in style or el.get("hidden") is not None:
             continue
 
-        is_disabled = inp.get("disabled") is not None
-        # Проверяем родительский label/div на классы sold-out
-        parent = inp.parent
-        if parent and hasattr(parent, "get"):
-            p_classes = " ".join(parent.get("class", [])).lower()
-            if any(c in p_classes for c in [
-                "sold-out", "soldout", "is-unavailable", "unavailable",
-                "disabled", "is-disabled", "no-stock", "out-of-stock"
-            ]):
-                is_disabled = True
-            p_style = (parent.get("style") or "").replace(" ", "").lower()
-            if "display:none" in p_style or "line-through" in p_style:
-                continue  # скрытый шаблон — пропускаем целиком
+        classes = " ".join(el.get("class", [])).lower()
+        if "active-block" in classes and "inactive-block" not in classes:
+            is_sold_out = False
+        elif "inactive-block" in classes:
+            is_sold_out = True
+        else:
+            try:
+                is_sold_out = float(el.get("data-count", "0") or "0") <= 0
+            except (ValueError, TypeError):
+                is_sold_out = False
 
-        visible[val.lower()] = is_disabled
+        data_price = el.get("data-price") or el.get("data-main-price") or ""
+        if data_price:
+            try:
+                p_float = float(data_price)
+                p_str = str(int(p_float // 100)) if p_float > 10000 else str(int(p_float))
+                prices[title_attr.lower()] = p_str
+            except (ValueError, TypeError):
+                pass
 
-    # ── Стратегия 2: label/span с data-val или data-value ────────────────────
+        visible[title_attr.lower()] = is_sold_out
+
+    # ── Стратегия 1: radio[type=radio] с name=size/option/variant ────────────
+    if not visible:
+        for inp in soup.find_all("input", type="radio"):
+            name_attr = (inp.get("name") or "").lower()
+            if not any(k in name_attr for k in ["size", "option", "variant"]):
+                continue
+            val = (inp.get("value") or "").strip()
+            if not val or len(val) > 30:
+                continue
+            style = (inp.get("style") or "").replace(" ", "").lower()
+            if "display:none" in style or inp.get("hidden") is not None:
+                continue
+
+            is_disabled = inp.get("disabled") is not None
+            parent = inp.parent
+            if parent and hasattr(parent, "get"):
+                p_cls = " ".join(parent.get("class", [])).lower()
+                if any(c in p_cls for c in [
+                    "sold-out", "soldout", "unavailable", "disabled",
+                    "is-disabled", "no-stock", "out-of-stock", "inactive"
+                ]):
+                    is_disabled = True
+                p_style = (parent.get("style") or "").replace(" ", "").lower()
+                if "display:none" in p_style or "line-through" in p_style:
+                    continue
+            visible[val.lower()] = is_disabled
+
+    # ── Стратегия 2: [data-val] / [data-value] ────────────────────────────────
     if not visible:
         for el in soup.select("[data-val], [data-value]"):
             val = (el.get("data-val") or el.get("data-value") or "").strip()
             if not val or len(val) > 30:
                 continue
-            # Фильтруем скрытые элементы
             style = (el.get("style") or "").replace(" ", "").lower()
             if "display:none" in style or el.get("hidden") is not None:
                 continue
-            parent = el.parent
-            if parent and hasattr(parent, "get"):
-                p_style = (parent.get("style") or "").replace(" ", "").lower()
-                if "display:none" in p_style:
-                    continue
-
             classes = " ".join(el.get("class", [])).lower()
             is_disabled = (
                 el.get("disabled") is not None
                 or any(c in classes for c in [
                     "sold-out", "soldout", "unavailable", "disabled",
-                    "is-disabled", "no-stock", "out-of-stock"
+                    "is-disabled", "no-stock", "out-of-stock", "inactive"
                 ])
             )
             visible[val.lower()] = is_disabled
 
-    # ── Стратегия 3: видимые <option> в <select name*=size/option> ───────────
+    # ── Стратегия 3: <select name*=size/option> ───────────────────────────────
     if not visible:
         for sel in soup.find_all("select"):
-            name_attr = (sel.get("name") or "").lower()
-            if not any(k in name_attr for k in ["size", "option", "variant"]):
+            if not any(k in (sel.get("name") or "").lower() for k in ["size", "option", "variant"]):
                 continue
-            sel_style = (sel.get("style") or "").replace(" ", "").lower()
-            if "display:none" in sel_style or sel.get("hidden") is not None:
+            if "display:none" in (sel.get("style") or "").replace(" ", "").lower():
                 continue
             for opt in sel.find_all("option"):
                 val = (opt.get("value") or opt.get_text(strip=True)).strip()
                 if not val or len(val) > 30:
                     continue
-                if any(p in val.lower() for p in ["вибер", "choose", "select", "оберіть"]):
+                if any(p in val.lower() for p in ["\u0432\u0438\u0431\u0435\u0440", "choose", "select", "\u043e\u0431\u0435\u0440\u0456\u0442\u044c"]):
                     continue
-                is_disabled = opt.get("disabled") is not None
-                visible[val.lower()] = is_disabled
+                visible[val.lower()] = opt.get("disabled") is not None
 
     if not visible:
-        # HTML не дал нам список размеров — возвращаем данные API без изменений
-        logger.debug("[Shopify filter] No visible size elements found in HTML, using API data as-is")
+        logger.debug("[Shopify filter] No HTML size elements found, using API data as-is")
         return result
 
-    # ── Фильтрация и коррекция статуса ────────────────────────────────────────
+    # ── Фильтрация и коррекция ────────────────────────────────────────────────
     filtered: list[dict] = []
     for v in result.variants:
         key = v["title"].lower()
         if key not in visible:
-            logger.debug("[Shopify filter] Dropping phantom variant '%s' (not in HTML)", v["title"])
+            logger.debug("[Shopify filter] Dropping phantom variant \'%s\'", v["title"])
             continue
         v_copy = dict(v)
-        if visible[key]:  # HTML говорит: sold-out
+        if visible[key]:
             v_copy["in_stock"] = False
+        if key in prices and prices[key]:
+            v_copy["price"] = prices[key]
         filtered.append(v_copy)
 
     if not filtered:
-        # После фильтрации ничего не осталось — скорее всего HTML не совпал.
-        # Безопасный откат: возвращаем оригинал
-        logger.warning("[Shopify filter] All variants filtered out, falling back to API data")
+        logger.warning("[Shopify filter] Filtering removed all variants, falling back to API data")
         return result
 
     logger.info(
-        "[Shopify filter] %d → %d variants after HTML cross-ref (visible: %s)",
-        len(result.variants), len(filtered), list(visible.keys())
+        "[Shopify filter] %d -> %d variants | %s",
+        len(result.variants), len(filtered),
+        {k: ("sold-out" if sv else "in-stock") for k, sv in visible.items()},
     )
+
+    in_stock_vs = [v for v in filtered if v["in_stock"]]
+    base_price = (in_stock_vs[0]["price"] if in_stock_vs else filtered[0]["price"]) or result.price
+
     return ParseResult(
         title=result.title,
-        price=filtered[0]["price"] or result.price,
+        price=base_price,
         currency=result.currency,
-        is_in_stock=any(v["in_stock"] for v in filtered),
+        is_in_stock=bool(in_stock_vs),
         source=result.source,
         variants=filtered,
     )
