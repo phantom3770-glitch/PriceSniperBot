@@ -673,10 +673,41 @@ def _detect_variant_and_stock(
                 return None, True, all_variants
 
     if not all_variants and soup:
-        # 1. Поиск элементов выбора вариантов (.variant-item, .size-item, .swatch-element) в контейнере товара
-        product_box = soup.select_one("form[action*='cart'], [class*='product-detail'], [class*='product-info'], [class*='product-single'], main, #main") or soup
-        variant_elements = product_box.select(".variant-item, [class*='variant-item'], [class*='size-item'], [class*='swatch-element'], .size-swatch, .variant-option")
+        # Хелпер: проверка видимости элемента (скрытые JS-шаблоны исключаем)
+        def _is_hidden(el) -> bool:
+            style = (el.get("style") or "").replace(" ", "").lower()
+            if "display:none" in style or "visibility:hidden" in style:
+                return True
+            if el.get("hidden") is not None:
+                return True
+            if el.get("type", "").lower() == "hidden":
+                return True
+            # Проверяем родителей (до 3 уровней вверх)
+            parent = el.parent
+            for _ in range(3):
+                if parent is None:
+                    break
+                p_style = (parent.get("style") or "").replace(" ", "").lower() if hasattr(parent, 'get') else ""
+                if "display:none" in p_style or "visibility:hidden" in p_style:
+                    return True
+                if hasattr(parent, 'get') and parent.get("hidden") is not None:
+                    return True
+                parent = parent.parent
+            return False
+
+        # 1. Поиск видимых элементов выбора вариантов в контейнере товара
+        product_box = soup.select_one(
+            "form[action*='cart'], [class*='product-detail'], [class*='product-info'], "
+            "[class*='product-single'], main, #main"
+        ) or soup
+        variant_elements = product_box.select(
+            ".variant-item, [class*='variant-item'], [class*='size-item'], "
+            "[class*='swatch-element'], .size-swatch, .variant-option"
+        )
         for el in variant_elements:
+            # Пропускаем скрытые JS-шаблоны
+            if _is_hidden(el):
+                continue
             t_clean = el.get_text(strip=True)
             if not t_clean or len(t_clean) > 25:
                 continue
@@ -684,9 +715,15 @@ def _detect_variant_and_stock(
             is_disabled = (
                 el.get("disabled") is not None
                 or el.get("aria-disabled") == "true"
-                or any(d in classes for d in ["disabled", "is-disabled", "out-of-stock", "sold-out", "unavailable", "no-stock", "cross"])
+                or any(d in classes for d in [
+                    "disabled", "is-disabled", "out-of-stock",
+                    "sold-out", "unavailable", "no-stock", "cross"
+                ])
             )
-            clean_name = re.sub(r"\s*\((?:немає|нет|out of stock|розпродано)[^)]*\)", "", t_clean, flags=re.IGNORECASE).strip()
+            clean_name = re.sub(
+                r"\s*\((?:немає|нет|out of stock|розпродано)[^)]*\)", "",
+                t_clean, flags=re.IGNORECASE
+            ).strip()
             key = clean_name.lower()
             if clean_name and key not in seen_variants:
                 seen_variants.add(key)
@@ -697,30 +734,44 @@ def _detect_variant_and_stock(
                     "price": ""
                 })
 
-        # 2. Поиск <option> в выпадающих списках <select>
+        # 2. Поиск <option> в видимых выпадающих списках <select>
         for select in soup.find_all("select"):
+            if _is_hidden(select):
+                continue
             for opt in select.find_all("option"):
+                if opt.get("type", "").lower() == "hidden":
+                    continue
                 opt_text = opt.get_text(strip=True)
-                if opt_text and not any(p in opt_text.lower() for p in ["выберите", "оберіть", "choose", "select"]):
-                    classes = [c.lower() for c in opt.get("class", [])]
-                    opt_disabled = (
-                        opt.get("disabled") is not None
-                        or any(d in classes for d in ["disabled", "out-of-stock", "sold-out", "unavailable"])
-                        or any(w in opt_text.lower() for w in ["немає", "нет в наличии", "out of stock", "розпродано"])
-                    )
-                    clean_name = re.sub(r"\s*\((?:немає|нет|out of stock|розпродано)[^)]*\)", "", opt_text, flags=re.IGNORECASE).strip()
-                    key = clean_name.lower()
-                    if clean_name and key not in seen_variants:
-                        seen_variants.add(key)
-                        all_variants.append({
-                            "id": opt.get("value") or clean_name,
-                            "title": clean_name,
-                            "in_stock": not opt_disabled,
-                            "price": ""
-                        })
+                if not opt_text:
+                    continue
+                if any(p in opt_text.lower() for p in ["выберите", "оберіть", "choose", "select"]):
+                    continue
+                classes = [c.lower() for c in opt.get("class", [])]
+                opt_disabled = (
+                    opt.get("disabled") is not None
+                    or any(d in classes for d in ["disabled", "out-of-stock", "sold-out", "unavailable"])
+                    or any(w in opt_text.lower() for w in ["немає", "нет в наличии", "out of stock", "розпродано"])
+                )
+                clean_name = re.sub(
+                    r"\s*\((?:немає|нет|out of stock|розпродано)[^)]*\)", "",
+                    opt_text, flags=re.IGNORECASE
+                ).strip()
+                key = clean_name.lower()
+                if clean_name and key not in seen_variants:
+                    seen_variants.add(key)
+                    all_variants.append({
+                        "id": opt.get("value") or clean_name,
+                        "title": clean_name,
+                        "in_stock": not opt_disabled,
+                        "price": ""
+                    })
 
     if not variant_label and soup:
         for select in soup.find_all("select"):
+            # Пропускаем скрытые select
+            style = (select.get("style") or "").replace(" ", "").lower()
+            if "display:none" in style or select.get("hidden") is not None:
+                continue
             selected_opt = select.find("option", selected=True)
             if not selected_opt:
                 for opt in select.find_all("option"):
@@ -736,7 +787,10 @@ def _detect_variant_and_stock(
                         or any(d in classes for d in ["disabled", "out-of-stock", "sold-out", "unavailable"])
                         or any(w in opt_text.lower() for w in ["немає", "нет в наличии", "out of stock", "розпродано"])
                     )
-                    clean_name = re.sub(r"\s*\((?:немає|нет|out of stock|розпродано)[^)]*\)", "", opt_text, flags=re.IGNORECASE).strip()
+                    clean_name = re.sub(
+                        r"\s*\((?:немає|нет|out of stock|розпродано)[^)]*\)", "",
+                        opt_text, flags=re.IGNORECASE
+                    ).strip()
                     if size_pattern.match(clean_name):
                         variant_label = f"Размер: {clean_name}"
                     else:

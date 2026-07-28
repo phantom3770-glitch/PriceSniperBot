@@ -741,71 +741,106 @@ async def handle_text(message: Message) -> None:
 # ── Callback: обработка выбора размера на основе item_id из БД ───────────────
 @router.callback_query(F.data.startswith("sz:"))
 async def cb_select_size(callback: CallbackQuery) -> None:
-    parts = callback.data.split(":")  # type: ignore[union-attr]
-    if len(parts) < 3:
-        await callback.answer()
-        return
-
-    item_id = int(parts[1])
-    size_name = unquote(parts[2])
-    user_id = callback.from_user.id
-    lang = await _get_lang(user_id) or "en"
-
-    # Ответ на callback сразу
+    # ПЕРВЫМ ДЕЛОМ гасим анимацию нажатия кнопки — чтобы Telegram не зависал
     await callback.answer()
 
-    # 1. Извлекаем созданный товар из SQLite
-    item = await get_item_by_id(item_id)
-    if not item:
-        await callback.message.edit_text(t(lang, "parse_error"), parse_mode=ParseMode.HTML)  # type: ignore[union-attr]
-        return
+    try:
+        parts = callback.data.split(":")  # type: ignore[union-attr]
+        if len(parts) < 3:
+            return
 
-    # 2. Формируем целевую ссылку с параметром размера и перепарсиваем
-    base_url = item["url"]
-    sep = "&" if "?" in base_url else "?"
-    size_url = f"{base_url}{sep}size={quote(size_name)}"
+        item_id = int(parts[1])
+        size_name = unquote(parts[2])
+        user_id = callback.from_user.id
+        lang = await _get_lang(user_id) or "en"
 
-    parsed = await parse_product(size_url)
+        # 1. Извлекаем созданный товар из SQLite по item_id (не RAM!)
+        item = await get_item_by_id(item_id)
+        if not item:
+            await callback.message.edit_text(  # type: ignore[union-attr]
+                t(lang, "parse_error"), parse_mode=ParseMode.HTML
+            )
+            return
 
-    # 3. Формируем название с понятной меткой размера
-    size_pattern = re.compile(r"^(XXS|XS|S|M|L|XL|XXL|3XL|4XL|5XL|[2-5]?XL|\d{2,3})$", re.IGNORECASE)
-    variant_label = f"Размер: {size_name}" if size_pattern.match(size_name) else f"Вариант: {size_name}"
+        # 2. Формируем URL с выбранным размером и перепарсиваем страницу
+        base_url = item["url"]
+        sep = "&" if "?" in base_url else "?"
+        size_url = f"{base_url}{sep}size={quote(size_name)}"
 
-    raw_title = item.get("title") or parsed.title or ""
-    clean_base_title = re.sub(r"\s*\((?:Размер|Вариант|Розмір):[^)]*\)", "", raw_title, flags=re.IGNORECASE).strip()
-    full_title = f"{clean_base_title} ({variant_label})"
+        parsed = await parse_product(size_url)
 
-    price = parsed.price or item.get("price") or ""
+        # 3. ЕДИНЫЙ ИСТОЧНИК ПРАВДЫ для наличия:
+        #    parse_product возвращает is_in_stock для конкретного размера
+        is_in_stock: bool = parsed.is_in_stock
 
-    # 4. Сохраняем обновленные параметры в SQLite
-    await update_item_variant(
-        item_id=item_id,
-        url=size_url,
-        title=full_title,
-        price=price,
-        is_in_stock=parsed.is_in_stock,
-    )
+        # 4. Формируем название с понятной меткой размера
+        size_pattern = re.compile(
+            r"^(XXS|XS|S|M|L|XL|XXL|3XL|4XL|5XL|[2-5]?XL|\d{2,3})$",
+            re.IGNORECASE
+        )
+        variant_label = (
+            f"Размер: {size_name}" if size_pattern.match(size_name)
+            else f"Вариант: {size_name}"
+        )
 
-    result = ParseResult(
-        title=full_title,
-        price=price,
-        currency=parsed.currency or item.get("currency") or "₴",
-        is_in_stock=parsed.is_in_stock,
-        source="variant_selector",
-    )
+        raw_title = item.get("title") or parsed.title or ""
+        clean_base_title = re.sub(
+            r"\s*\((?:Размер|Вариант|Розмір):[^)]*\)", "",
+            raw_title, flags=re.IGNORECASE
+        ).strip()
+        full_title = f"{clean_base_title} ({variant_label})"
 
-    # 5. Превращаем меню выбора вариантов в итоговую карточку товара
-    await callback.message.edit_text(  # type: ignore[union-attr]
-        _card_from_result(lang, result),
-        parse_mode=ParseMode.HTML,
-        reply_markup=_item_kb(item_id, size_url, lang, full_title),
-    )
+        price = parsed.price or item.get("price") or ""
+        currency = parsed.currency or item.get("currency") or "₴"
 
-    # 6. Отправляем пользователю сообщение-подтверждение
-    await callback.message.answer(  # type: ignore[union-attr]
-        t(lang, "variant_target_added", variant=size_name),
-        parse_mode=ParseMode.HTML,
-    )
+        # 5. Сохраняем все обновлённые параметры в SQLite (commit гарантирован)
+        await update_item_variant(
+            item_id=item_id,
+            url=size_url,
+            title=full_title,
+            price=price,
+            is_in_stock=is_in_stock,
+        )
+
+        logger.info(
+            "Size selected: item_id=%s size=%s in_stock=%s user=%s",
+            item_id, size_name, is_in_stock, user_id
+        )
+
+        result = ParseResult(
+            title=full_title,
+            price=price,
+            currency=currency,
+            is_in_stock=is_in_stock,
+            source="variant_selector",
+        )
+
+        # 6. Заменяем меню выбора вариантов итоговой карточкой товара
+        await callback.message.edit_text(  # type: ignore[union-attr]
+            _card_from_result(lang, result),
+            parse_mode=ParseMode.HTML,
+            reply_markup=_item_kb(item_id, size_url, lang, full_title),
+        )
+
+        # 7. Подтверждение пользователю
+        await callback.message.answer(  # type: ignore[union-attr]
+            t(lang, "variant_target_added", variant=size_name),
+            parse_mode=ParseMode.HTML,
+        )
+
+    except Exception as exc:
+        logger.error(
+            "cb_select_size error [callback.data=%s]: %s",
+            callback.data, exc, exc_info=True
+        )
+        try:
+            user_id = callback.from_user.id
+            lang = await _get_lang(user_id) or "en"
+            await callback.message.edit_text(  # type: ignore[union-attr]
+                t(lang, "parse_error"), parse_mode=ParseMode.HTML
+            )
+        except Exception:
+            pass
 
 
 # ── Точка входа ───────────────────────────────────────────────────────────────
