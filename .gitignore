@@ -8,7 +8,9 @@ venv/
 
 # База данных SQLite
 *.db
+*.sqlite
 *.sqlite3
+price_sniper.db
 
 # Кэш Python
 __pycache__/

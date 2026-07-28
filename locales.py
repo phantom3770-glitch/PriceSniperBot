@@ -95,6 +95,14 @@ TEXTS: dict[str, dict[str, str]] = {
         "title_unknown": "Назва не знайдена",
 
         # Сповіщення планировщика
+        "select_variant_prompt": (
+            "📦 <b>У цього товару є декілька варіантів.</b>\n"
+            "Будь ласка, оберіть потрібний розмір або колір:"
+        ),
+        "variant_target_added": (
+            "✅ <b>Ціль додано до списку відстеження!</b>\n"
+            "Повідомимо, коли розмір <b>{variant}</b> з'явиться в наявності."
+        ),
         "price_drop": (
             "🔥 <b>Снайпер зафіксував знижку!</b>\n\n"
             "📌 {title}\n"
@@ -198,6 +206,14 @@ TEXTS: dict[str, dict[str, str]] = {
         "title_unknown": "Title not found",
 
         # Scheduler notifications
+        "select_variant_prompt": (
+            "📦 <b>This product has multiple variants.</b>\n"
+            "Please select the desired size or option:"
+        ),
+        "variant_target_added": (
+            "✅ <b>Target added to tracking list!</b>\n"
+            "We will notify you when size <b>{variant}</b> is in stock."
+        ),
         "price_drop": (
             "🔥 <b>Sniper spotted a price drop!</b>\n\n"
             "📌 {title}\n"
@@ -301,6 +317,14 @@ TEXTS: dict[str, dict[str, str]] = {
         "title_unknown": "Название не найдено",
 
         # Уведомления планировщика
+        "select_variant_prompt": (
+            "📦 <b>У этого товара есть несколько вариантов.</b>\n"
+            "Пожалуйста, выберите нужный размер или цвет:"
+        ),
+        "variant_target_added": (
+            "✅ <b>Цель добавлена в список отслеживания!</b>\n"
+            "Уведомим, когда размер <b>{variant}</b> появится в наличии."
+        ),
         "price_drop": (
             "🔥 <b>Снайпер зафиксировал скидку!</b>\n\n"
             "📌 {title}\n"

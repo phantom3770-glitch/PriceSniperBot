@@ -107,8 +107,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── Кэш языков пользователей в памяти ────────────────────────────────────────
+from uuid import uuid4
+
+# ── Кэш языков пользователей и ожидающих выбора вариантов ─────────────────────
 _lang_cache: dict[int, str] = {}
+_pending_variants: dict[str, dict] = {}
 
 # ── Регулярка для поиска URL в тексте ────────────────────────────────────────
 URL_RE = re.compile(
@@ -192,6 +195,28 @@ def _item_kb(item_id: int, url: str, lang: str, title: str = "") -> InlineKeyboa
             ],
         ]
     )
+
+
+def _variant_selector_kb(session_id: str, variants: list[dict]) -> InlineKeyboardMarkup:
+    """Создаёт инлайн-кнопки выбора вариантов товара с их статусом (🟢 / 🔴)."""
+    rows: list[list[InlineKeyboardButton]] = []
+    current_row: list[InlineKeyboardButton] = []
+    for idx, v in enumerate(variants):
+        emoji = "🟢" if v.get("in_stock", True) else "🔴"
+        title = v.get("title", "")
+        btn_text = f"{emoji} {title}"
+        current_row.append(
+            InlineKeyboardButton(
+                text=btn_text,
+                callback_data=f"vsel:{session_id}:{idx}",
+            )
+        )
+        if len(current_row) == 3:
+            rows.append(current_row)
+            current_row = []
+    if current_row:
+        rows.append(current_row)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 # ── Настройка команд бота (синяя кнопка «Меню» в Telegram) ───────────────────
@@ -659,7 +684,25 @@ async def handle_text(message: Message) -> None:
         )
         return
 
-    # 4. Сохраняем → получаем item_id
+    # 4. Если у товара есть несколько вариантов и конкретный вариант не указан в URL
+    if len(result.variants) > 1:
+        session_id = uuid4().hex[:8]
+        _pending_variants[session_id] = {
+            "user_id": user_id,
+            "url": url,
+            "base_title": result.title,
+            "price": result.price,
+            "currency": result.currency,
+            "variants": result.variants,
+        }
+        await status_msg.edit_text(
+            t(lang, "select_variant_prompt"),
+            parse_mode=ParseMode.HTML,
+            reply_markup=_variant_selector_kb(session_id, result.variants),
+        )
+        return
+
+    # 5. Сохраняем → получаем item_id
     item_id = await save_item(
         user_id=user_id,
         url=url,
@@ -669,15 +712,95 @@ async def handle_text(message: Message) -> None:
         is_in_stock=result.is_in_stock,
     )
 
-    # 5. Редактируем "изучаю..." → карточка + кнопки
+    # 6. Редактируем "изучаю..." → карточка + кнопки
     await status_msg.edit_text(
         _card_from_result(lang, result),
         parse_mode=ParseMode.HTML,
         reply_markup=_item_kb(item_id, url, lang, result.title or ""),
     )
 
-    # 6. Подтверждение добавления
+    # 7. Подтверждение добавления
     await message.answer(t(lang, "item_added"), parse_mode=ParseMode.HTML)
+
+
+# ── Callback: выбор конкретного варианта/размера ─────────────────────────────
+@router.callback_query(F.data.startswith("vsel:"))
+async def cb_select_variant(callback: CallbackQuery) -> None:
+    parts = callback.data.split(":")  # type: ignore[union-attr]
+    if len(parts) < 3:
+        await callback.answer()
+        return
+
+    session_id = parts[1]
+    idx = int(parts[2])
+    user_id = callback.from_user.id
+    lang = await _get_lang(user_id) or "en"
+
+    pending = _pending_variants.pop(session_id, None)
+    if not pending:
+        await callback.answer("Expired / Вже вибрано", show_alert=True)
+        return
+
+    variants = pending.get("variants", [])
+    if idx >= len(variants):
+        await callback.answer("Variant not found", show_alert=True)
+        return
+
+    selected_v = variants[idx]
+    v_title = selected_v.get("title", "")
+    v_in_stock = bool(selected_v.get("in_stock", True))
+    v_price = selected_v.get("price") or pending["price"]
+
+    # Формируем название с указанием выбранного размера/опции
+    size_pattern = re.compile(r"^(XXS|XS|S|M|L|XL|XXL|3XL|4XL|5XL|[2-5]?XL|\d{2,3})$", re.IGNORECASE)
+    variant_label = f"Размер: {v_title}" if size_pattern.match(v_title) else f"Вариант: {v_title}"
+
+    base_title = pending["base_title"]
+    if variant_label not in base_title:
+        full_title = f"{base_title} ({variant_label})"
+    else:
+        full_title = base_title
+
+    # Создаём целевой URL с параметром варианта
+    base_url = pending["url"]
+    v_id = selected_v.get("id") or v_title
+    sep = "&" if "?" in base_url else "?"
+    if v_id.isdigit():
+        target_url = f"{base_url}{sep}variant={v_id}"
+    else:
+        target_url = f"{base_url}{sep}size={quote(v_title)}"
+
+    # Сохраняем вариант в БД
+    item_id = await save_item(
+        user_id=user_id,
+        url=target_url,
+        title=full_title,
+        price=v_price,
+        currency=pending["currency"],
+        is_in_stock=v_in_stock,
+    )
+
+    result = ParseResult(
+        title=full_title,
+        price=v_price,
+        currency=pending["currency"],
+        is_in_stock=v_in_stock,
+        source="variant_selector",
+    )
+
+    # Редактируем сообщение со списком вариантов → превращаем в карточку товара
+    await callback.message.edit_text(  # type: ignore[union-attr]
+        _card_from_result(lang, result),
+        parse_mode=ParseMode.HTML,
+        reply_markup=_item_kb(item_id, target_url, lang, full_title),
+    )
+
+    # Отправляем подтверждение пользователю
+    await callback.message.answer(  # type: ignore[union-attr]
+        t(lang, "variant_target_added", variant=v_title),
+        parse_mode=ParseMode.HTML,
+    )
+    await callback.answer(t(lang, "item_added_popup"), show_alert=False)
 
 
 # ── Точка входа ───────────────────────────────────────────────────────────────
