@@ -1,6 +1,6 @@
 """
 PriceSniper Bot — Telegram-бот для отслеживания цен и наличия товаров.
-Stack: aiogram 3.x | python-dotenv | httpx | beautifulsoup4 | google-genai | aiosqlite
+Stack: aiogram 3.x | python-dotenv | curl_cffi | httpx | beautifulsoup4 | google-genai | aiosqlite
 
 Команды бота:
   /start    → приветствие + главное меню
@@ -10,17 +10,25 @@ Stack: aiogram 3.x | python-dotenv | httpx | beautifulsoup4 | google-genai | aio
 Обработчики ReplyKeyboard:
   📋 Мои товары   → _send_list()
   🔄 Обновить цены → ручной рефреш всех товаров
-  🌐 Сменить язык → показать выбор языка (с кнопкой «Назад»)
+  🌐 Сменить язык → показать выбор языка
 
 Callback-обработчики (InlineKeyboard):
-  lang:{code}  → установить язык
-  del:{id}     → удалить товар из БД
-  back:main    → вернуться в главное меню
+  lang:{code}           → установить язык
+  del:{id}              → удалить товар из БД
+  back:main             → вернуться в главное меню
+  sz:{item_id}:{variant} → выбрать вариант товара (stateless — данные в callback_data)
 
 URL в тексте → парсинг + сохранение + карточка с кнопками
+
+Принципы:
+  - callback.answer() ВСЕГДА первым в любом callback-handler
+  - Статус наличия варианта берётся из variants_json в БД (без HTTP-запроса)
+  - is_in_stock в карточке читается СТРОГО из поля in_stock в SQLite
+  - user_id всегда приводится к int
 """
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -64,6 +72,7 @@ from database import (
     save_item,
     update_item_data,
     update_item_variant,
+    update_item_variants_json,
     upsert_user,
 )
 from locales import t
@@ -94,8 +103,9 @@ class UserAutoSaveMiddleware(BaseMiddleware):
                     lang = "uk"
                 elif code.startswith("ru"):
                     lang = "ru"
-            await ensure_user(event_user.id, default_lang=lang)
+            await ensure_user(int(event_user.id), default_lang=lang)
         return await handler(event, data)
+
 
 # ── Конфигурация ──────────────────────────────────────────────────────────────
 BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
@@ -116,6 +126,12 @@ URL_RE = re.compile(
     r"https?://[^\s]+"
     r"|www\.[^\s]+"
     r"|[a-zA-Z0-9-]+\.(com|ua|ru|net|org|shop|store|biz)/[^\s]*",
+    re.IGNORECASE,
+)
+
+# Паттерн стандартных размеров одежды/обуви
+_SIZE_PATTERN = re.compile(
+    r"^(XXS|XS|S|M|L|XL|XXL|XXXL|3XL|4XL|5XL|[2-5]?XL|\d{2,3}(?:[./]\d{1,2})?)$",
     re.IGNORECASE,
 )
 
@@ -146,8 +162,7 @@ def _main_kb(lang: str) -> ReplyKeyboardMarkup:
 def _lang_kb(lang: str | None = None) -> InlineKeyboardMarkup:
     """
     Инлайн-клавиатура выбора языка.
-    Если lang задан (пользователь уже выбирал язык) — добавляет кнопку «Назад».
-    Для новых пользователей кнопки «Назад» нет.
+    Если lang задан — добавляет кнопку «Назад».
     """
     rows: list[list[InlineKeyboardButton]] = [
         [
@@ -196,7 +211,11 @@ def _item_kb(item_id: int, url: str, lang: str, title: str = "") -> InlineKeyboa
 
 
 def _variant_selector_kb(item_id: int, variants: list[dict], lang: str = "en") -> InlineKeyboardMarkup:
-    """Создаёт инлайн-кнопки выбора вариантов товара на основе item_id из БД."""
+    """
+    Создаёт инлайн-кнопки выбора вариантов товара.
+    Данные варианта кодируются прямо в callback_data (stateless).
+    Формат: sz:{item_id}:{url_encoded_variant_name}
+    """
     rows: list[list[InlineKeyboardButton]] = []
     current_row: list[InlineKeyboardButton] = []
 
@@ -213,11 +232,9 @@ def _variant_selector_kb(item_id: int, variants: list[dict], lang: str = "en") -
         if not title:
             continue
 
-        if in_stock:
-            btn_text = f"{emoji} {title}"
-        else:
-            btn_text = f"{emoji} {title} ({no_stock_label})"
+        btn_text = f"{emoji} {title}" if in_stock else f"{emoji} {title} ({no_stock_label})"
 
+        # Название варианта кодируется в URL-safe формат для callback_data
         safe_title = quote(title, safe="")
 
         current_row.append(
@@ -236,7 +253,7 @@ def _variant_selector_kb(item_id: int, variants: list[dict], lang: str = "en") -
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-# ── Настройка команд бота (синяя кнопка «Меню» в Telegram) ───────────────────
+# ── Настройка команд бота ─────────────────────────────────────────────────────
 async def _set_bot_commands(bot: Bot) -> None:
     """Регистрирует команды бота для каждого языка интерфейса Telegram."""
     commands: dict[str, list[BotCommand]] = {
@@ -258,13 +275,11 @@ async def _set_bot_commands(bot: Bot) -> None:
     }
     for lang_code, cmds in commands.items():
         await bot.set_my_commands(cmds, language_code=lang_code)
-    # Дефолтный список (для пользователей без совпадающего языка)
     await bot.set_my_commands(commands["en"])
 
-    # Для администратора — отдельное меню с /admin (видно только ему)
     if ADMIN_ID:
         admin_cmds = [
-            BotCommand(command="admin",    description="\u2699\ufe0f Панель администратора"),
+            BotCommand(command="admin", description="\u2699\ufe0f Панель администратора"),
             *commands["ru"],
         ]
         try:
@@ -286,33 +301,41 @@ router = Router()
 # ── Вспомогательные функции ───────────────────────────────────────────────────
 async def _get_lang(user_id: int) -> str | None:
     """Язык из кэша; при промахе — из БД."""
-    if user_id not in _lang_cache:
-        lang = await get_user_language(user_id)
+    uid = int(user_id)
+    if uid not in _lang_cache:
+        lang = await get_user_language(uid)
         if lang:
-            _lang_cache[user_id] = lang
-    return _lang_cache.get(user_id)
+            _lang_cache[uid] = lang
+    return _lang_cache.get(uid)
 
 
 async def _set_lang(user_id: int, lang: str) -> None:
     """Сохраняет язык в кэш и в БД."""
-    _lang_cache[user_id] = lang
-    await upsert_user(user_id, lang)
+    uid = int(user_id)
+    _lang_cache[uid] = lang
+    await upsert_user(uid, lang)
 
 
-def _format_card(
+def _format_item_text(
     lang: str,
     title: str,
     price: str,
     currency: str,
-    is_in_stock: bool,
+    in_stock: int | bool,
 ) -> str:
-    """Универсальная функция форматирования карточки товара."""
+    """
+    Единственный источник правды для отображения карточки товара.
+    Статус читается ИСКЛЮЧИТЕЛЬНО из переданного поля in_stock (0/1 из SQLite или bool).
+      in_stock == 1 (True)  → ✅ В наличии
+      in_stock == 0 (False) → ❌ Нет в наличии
+    """
     display_title = title or t(lang, "title_unknown")
     price_str = (
         f"{price} {currency}".strip() if price else t(lang, "price_unknown")
     )
-    stock_emoji = "✅" if is_in_stock else "❌"
-    stock_label = t(lang, "stock_yes" if is_in_stock else "stock_no")
+    is_available = bool(int(in_stock) if isinstance(in_stock, (int, str)) else in_stock)
+    stock_emoji = "✅" if is_available else "❌"
+    stock_label = t(lang, "stock_yes" if is_available else "stock_no")
     return t(
         lang, "item_card",
         title=display_title,
@@ -323,22 +346,24 @@ def _format_card(
 
 
 def _card_from_db(lang: str, item: dict) -> str:
-    return _format_card(
+    """Форматирует карточку из записи БД. Статус берётся из поля in_stock."""
+    return _format_item_text(
         lang,
         title=item.get("title") or "",
         price=item.get("price") or "",
         currency=item.get("currency") or "",
-        is_in_stock=bool(item.get("is_in_stock", False)),
+        in_stock=item.get("in_stock", 0),
     )
 
 
 def _card_from_result(lang: str, result: ParseResult) -> str:
-    return _format_card(
+    """Форматирует карточку из ParseResult."""
+    return _format_item_text(
         lang,
         title=result.title,
         price=result.price,
         currency=result.currency,
-        is_in_stock=result.is_in_stock,
+        in_stock=result.is_in_stock,
     )
 
 
@@ -346,8 +371,9 @@ async def _send_list(target: Message, user_id: int, lang: str) -> None:
     """
     Отправляет список всех товаров пользователя.
     Каждый товар — отдельное сообщение с инлайн-кнопками.
+    Статус читается из in_stock поля в БД.
     """
-    items = await get_user_items(user_id)
+    items = await get_user_items(int(user_id))
     if not items:
         await target.answer(t(lang, "list_empty"), parse_mode=ParseMode.HTML)
         return
@@ -368,10 +394,20 @@ def _no_lang_prompt() -> str:
     return "👋 | 🇺🇦 Оберіть мову  •  🇬🇧 Choose language  •  🇷🇺 Выберите язык:"
 
 
+def _strip_variant_suffix(title: str) -> str:
+    """Удаляет суффикс «(Размер: M)» / «(Вариант: ...)» / «(Розмір: ...)» из названия."""
+    return re.sub(
+        r"\s*\((?:Размер|Вариант|Розмір|Розмір|Size|Variant|Колір|Цвет|Colour):[^)]*\)",
+        "",
+        title,
+        flags=re.IGNORECASE,
+    ).strip()
+
+
 # ── /start ────────────────────────────────────────────────────────────────────
 @router.message(CommandStart())
 async def cmd_start(message: Message, command: CommandObject) -> None:
-    user_id = message.from_user.id  # type: ignore[union-attr]
+    user_id = int(message.from_user.id)  # type: ignore[union-attr]
     lang = await _get_lang(user_id)
     args = command.args
 
@@ -421,7 +457,7 @@ async def cmd_start(message: Message, command: CommandObject) -> None:
 # ── /list ─────────────────────────────────────────────────────────────────────
 @router.message(Command("list"))
 async def cmd_list(message: Message) -> None:
-    user_id = message.from_user.id  # type: ignore[union-attr]
+    user_id = int(message.from_user.id)  # type: ignore[union-attr]
     lang = await _get_lang(user_id)
     if not lang:
         await message.answer(_no_lang_prompt(), reply_markup=_lang_kb())
@@ -432,23 +468,24 @@ async def cmd_list(message: Message) -> None:
 # ── /language ─────────────────────────────────────────────────────────────────
 @router.message(Command("language"))
 async def cmd_language(message: Message) -> None:
-    """Показывает выбор языка с кнопкой «Назад» (если язык уже выбран)."""
-    user_id = message.from_user.id  # type: ignore[union-attr]
+    user_id = int(message.from_user.id)  # type: ignore[union-attr]
     lang = await _get_lang(user_id)
     await message.answer(
         _no_lang_prompt(),
-        reply_markup=_lang_kb(lang),  # lang=None → без кнопки «Назад»
+        reply_markup=_lang_kb(lang),
     )
 
 
 # ── Callback: выбор языка ─────────────────────────────────────────────────────
 @router.callback_query(F.data.startswith("lang:"))
 async def cb_select_language(callback: CallbackQuery) -> None:
+    # ПЕРВЫМ ДЕЛОМ — гасим анимацию нажатия кнопки
+    await callback.answer()
+
     lang = callback.data.split(":")[1]  # type: ignore[union-attr]
-    user_id = callback.from_user.id
+    user_id = int(callback.from_user.id)
 
     if lang not in ("uk", "en", "ru"):
-        await callback.answer("Unknown language")
         return
 
     await _set_lang(user_id, lang)
@@ -460,14 +497,15 @@ async def cb_select_language(callback: CallbackQuery) -> None:
         parse_mode=ParseMode.HTML,
         reply_markup=_main_kb(lang),
     )
-    await callback.answer()
 
 
 # ── Callback: «Назад» → главное меню ─────────────────────────────────────────
 @router.callback_query(F.data == "back:main")
 async def cb_back_main(callback: CallbackQuery) -> None:
-    """Возвращает пользователя в главное меню из экрана выбора языка."""
-    user_id = callback.from_user.id
+    # ПЕРВЫМ ДЕЛОМ — гасим анимацию нажатия кнопки
+    await callback.answer()
+
+    user_id = int(callback.from_user.id)
     lang = await _get_lang(user_id) or "en"
 
     await callback.message.delete()  # type: ignore[union-attr]
@@ -476,14 +514,16 @@ async def cb_back_main(callback: CallbackQuery) -> None:
         parse_mode=ParseMode.HTML,
         reply_markup=_main_kb(lang),
     )
-    await callback.answer()
 
 
 # ── Callback: удаление товара ─────────────────────────────────────────────────
 @router.callback_query(F.data.startswith("del:"))
 async def cb_delete_item(callback: CallbackQuery) -> None:
+    # ПЕРВЫМ ДЕЛОМ — гасим анимацию нажатия кнопки
+    await callback.answer(show_alert=False)
+
     item_id = int(callback.data.split(":")[1])  # type: ignore[union-attr]
-    user_id = callback.from_user.id
+    user_id = int(callback.from_user.id)
     lang = await _get_lang(user_id) or "en"
 
     await delete_item(item_id, user_id)
@@ -493,14 +533,16 @@ async def cb_delete_item(callback: CallbackQuery) -> None:
         t(lang, "item_deleted"),
         parse_mode=ParseMode.HTML,
     )
-    await callback.answer(t(lang, "item_deleted_popup"), show_alert=False)
 
 
-# ── Callback: добавление товара по шеринг-ссылке ──────────────────────────────
+# ── Callback: добавление товара по шеринг-ссылке ─────────────────────────────
 @router.callback_query(F.data.startswith("add:"))
 async def cb_add_shared_item(callback: CallbackQuery) -> None:
+    # ПЕРВЫМ ДЕЛОМ — гасим анимацию нажатия кнопки
+    await callback.answer()
+
     item_id = int(callback.data.split(":")[1])  # type: ignore[union-attr]
-    user_id = callback.from_user.id
+    user_id = int(callback.from_user.id)
     lang = await _get_lang(user_id) or "en"
 
     item = await get_item_by_id(item_id)
@@ -508,13 +550,23 @@ async def cb_add_shared_item(callback: CallbackQuery) -> None:
         await callback.answer(t(lang, "parse_error"), show_alert=True)
         return
 
+    # Восстанавливаем варианты из JSON если есть
+    variants: list[dict] | None = None
+    if item.get("variants_json"):
+        try:
+            variants = json.loads(item["variants_json"])
+        except Exception:
+            variants = None
+
     new_item_id = await save_item(
         user_id=user_id,
         url=item["url"],
-        title=item["title"] or "",
-        price=item["price"] or "",
-        currency=item["currency"] or "",
-        is_in_stock=bool(item["is_in_stock"]),
+        title=item.get("title") or "",
+        price=item.get("price") or "",
+        currency=item.get("currency") or "",
+        is_in_stock=bool(item.get("in_stock", 0)),
+        selected_variant=item.get("selected_variant"),
+        variants=variants,
     )
 
     await callback.message.edit_text(  # type: ignore[union-attr]
@@ -528,7 +580,7 @@ async def cb_add_shared_item(callback: CallbackQuery) -> None:
 # ── 📋 Мои товары ─────────────────────────────────────────────────────────────
 @router.message(F.text.in_(_LIST_BTNS))
 async def btn_my_items(message: Message) -> None:
-    user_id = message.from_user.id  # type: ignore[union-attr]
+    user_id = int(message.from_user.id)  # type: ignore[union-attr]
     lang = await _get_lang(user_id)
     if not lang:
         await message.answer(_no_lang_prompt(), reply_markup=_lang_kb())
@@ -539,7 +591,7 @@ async def btn_my_items(message: Message) -> None:
 # ── 🔄 Обновить цены ──────────────────────────────────────────────────────────
 @router.message(F.text.in_(_REFRESH_BTNS))
 async def btn_refresh(message: Message) -> None:
-    user_id = message.from_user.id  # type: ignore[union-attr]
+    user_id = int(message.from_user.id)  # type: ignore[union-attr]
     lang = await _get_lang(user_id)
     if not lang:
         await message.answer(_no_lang_prompt(), reply_markup=_lang_kb())
@@ -576,18 +628,18 @@ async def btn_refresh(message: Message) -> None:
 # ── 🌐 Сменить язык (ReplyKeyboard кнопка) ───────────────────────────────────
 @router.message(F.text.in_(_CHANGE_LANG_BTNS))
 async def btn_change_lang(message: Message) -> None:
-    user_id = message.from_user.id  # type: ignore[union-attr]
+    user_id = int(message.from_user.id)  # type: ignore[union-attr]
     lang = await _get_lang(user_id)
     await message.answer(
         _no_lang_prompt(),
-        reply_markup=_lang_kb(lang),  # с кнопкой «Назад» — язык уже выбран
+        reply_markup=_lang_kb(lang),
     )
 
 
 # ── 🎁 Пригласить друга (ReplyKeyboard кнопка) ────────────────────────────────
 @router.message(F.text.in_(_INVITE_BTNS))
 async def btn_invite_friend(message: Message) -> None:
-    user_id = message.from_user.id  # type: ignore[union-attr]
+    user_id = int(message.from_user.id)  # type: ignore[union-attr]
     lang = await _get_lang(user_id) or "en"
 
     kb = InlineKeyboardMarkup(
@@ -610,7 +662,7 @@ async def btn_invite_friend(message: Message) -> None:
 # ── Inline Query (для кнопок switch_inline_query) ─────────────────────────────
 @router.inline_query()
 async def inline_query_handler(query: InlineQuery) -> None:
-    user_id = query.from_user.id
+    user_id = int(query.from_user.id)
     lang = await _get_lang(user_id) or "en"
     raw_q = query.query.strip()
 
@@ -641,7 +693,6 @@ async def inline_query_handler(query: InlineQuery) -> None:
                 )
 
     if not results:
-        # Шеринг самого бота
         share_bot_text = t(lang, "share_bot_text")
         results.append(
             InlineQueryResultArticle(
@@ -661,9 +712,9 @@ async def inline_query_handler(query: InlineQuery) -> None:
 # ── /debug — диагностика БД (только для ADMIN_ID) ────────────────────────────
 @router.message(Command("debug"))
 async def cmd_debug(message: Message) -> None:
-    user_id = message.from_user.id  # type: ignore[union-attr]
+    user_id = int(message.from_user.id)  # type: ignore[union-attr]
     if ADMIN_ID and user_id != ADMIN_ID:
-        return  # Игнорируем для не-администраторов
+        return
 
     from database import DB_PATH
     import os
@@ -674,7 +725,7 @@ async def cmd_debug(message: Message) -> None:
         import aiosqlite
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
-            async with db.execute("SELECT id, user_id, title FROM items LIMIT 20") as cur:
+            async with db.execute("SELECT id, user_id, title, in_stock FROM items LIMIT 20") as cur:
                 rows = await cur.fetchall()
                 all_items_raw = [dict(r) for r in rows]
     except Exception as exc:
@@ -692,7 +743,10 @@ async def cmd_debug(message: Message) -> None:
         f"All items in DB: <b>{len(all_items_raw)}</b>",
     ]
     for i in all_items_raw[:10]:
-        lines.append(f"  • id={i.get('id')} user={i.get('user_id')} {str(i.get('title',''))[:40]}")
+        lines.append(
+            f"  • id={i.get('id')} user={i.get('user_id')} "
+            f"in_stock={i.get('in_stock')} {str(i.get('title',''))[:40]}"
+        )
 
     await message.answer("\n".join(lines), parse_mode=ParseMode.HTML)
 
@@ -705,7 +759,7 @@ async def handle_text(message: Message) -> None:
     Все остальные тексты (кнопки меню) перехвачены обработчиками выше.
     """
     text = message.text or ""
-    user_id = message.from_user.id  # type: ignore[union-attr]
+    user_id = int(message.from_user.id)  # type: ignore[union-attr]
     lang = await _get_lang(user_id)
 
     if not lang:
@@ -728,9 +782,10 @@ async def handle_text(message: Message) -> None:
     # 2. Парсинг
     result = await parse_product(url)
     logger.info(
-        "Parsed [%s] user=%s title='%s' price=%s%s stock=%s url=%s",
+        "Parsed [%s] user=%s title='%s' price=%s%s stock=%s variants=%d url=%s",
         result.source, user_id,
-        result.title, result.price, result.currency, result.is_in_stock, url,
+        result.title, result.price, result.currency,
+        result.is_in_stock, len(result.variants), url,
     )
 
     # 3. Ошибка парсинга
@@ -741,14 +796,16 @@ async def handle_text(message: Message) -> None:
         return
 
     # 4. Сохраняем базовый товар в БД → получаем item_id
+    #    Варианты сохраняем сразу в variants_json
     try:
         item_id = await save_item(
-            user_id=int(user_id),
+            user_id=user_id,
             url=url,
             title=result.title,
             price=result.price,
             currency=result.currency,
             is_in_stock=result.is_in_stock,
+            variants=result.variants if result.variants else None,
         )
     except Exception as exc:
         logger.error("Failed to save item for user %s: %s", user_id, exc, exc_info=True)
@@ -766,7 +823,7 @@ async def handle_text(message: Message) -> None:
         )
         return
 
-    # 6. Если вариант один — выводим готовую карточку товара
+    # 6. Если вариант один / нет вариантов — выводим готовую карточку товара
     await status_msg.edit_text(
         _card_from_result(lang, result),
         parse_mode=ParseMode.HTML,
@@ -777,10 +834,17 @@ async def handle_text(message: Message) -> None:
     await message.answer(t(lang, "item_added"), parse_mode=ParseMode.HTML)
 
 
-# ── Callback: обработка выбора размера на основе item_id из БД ───────────────
+# ── Callback: обработка выбора размера/варианта ───────────────────────────────
 @router.callback_query(F.data.startswith("sz:"))
 async def cb_select_size(callback: CallbackQuery) -> None:
-    # ПЕРВЫМ ДЕЛОМ гасим анимацию нажатия кнопки — чтобы Telegram не зависал
+    """
+    Обработчик выбора варианта товара (размер, цвет и т.д.).
+
+    Stateless: все данные берутся из callback_data и БД — без RAM-состояний.
+    Статус наличия определяется из variants_json в БД (без HTTP-запроса).
+    Если variants_json пуст — статус берётся из последнего парсинга.
+    """
+    # ПЕРВЫМ ДЕЛОМ — гасим анимацию нажатия кнопки (Telegram не зависает)
     await callback.answer()
 
     try:
@@ -789,11 +853,12 @@ async def cb_select_size(callback: CallbackQuery) -> None:
             return
 
         item_id = int(parts[1])
-        size_name = unquote(parts[2])
-        user_id = callback.from_user.id
+        # Декодируем название варианта (может содержать ":" — берём всё после второго ":")
+        size_name = unquote(":".join(parts[2:]))
+        user_id = int(callback.from_user.id)
         lang = await _get_lang(user_id) or "en"
 
-        # 1. Извлекаем созданный товар из SQLite по item_id (не RAM!)
+        # 1. Загружаем товар из SQLite (единственный источник правды)
         item = await get_item_by_id(item_id)
         if not item:
             await callback.message.edit_text(  # type: ignore[union-attr]
@@ -801,67 +866,78 @@ async def cb_select_size(callback: CallbackQuery) -> None:
             )
             return
 
-        # 2. Формируем URL с выбранным размером и перепарсиваем страницу
-        base_url = item["url"]
-        sep = "&" if "?" in base_url else "?"
-        size_url = f"{base_url}{sep}size={quote(size_name)}"
+        # 2. ЕДИНЫЙ ИСТОЧНИК ПРАВДЫ: определяем статус выбранного варианта
+        #    из сохранённого variants_json — БЕЗ повторного HTTP-запроса
+        is_in_stock: bool | None = None
+        variant_price: str = item.get("price") or ""
+        variant_currency: str = item.get("currency") or "₴"
 
-        parsed = await parse_product(size_url)
+        if item.get("variants_json"):
+            try:
+                saved_variants: list[dict] = json.loads(item["variants_json"])
+                size_name_lower = size_name.lower()
+                for sv in saved_variants:
+                    if sv.get("title", "").lower() == size_name_lower:
+                        is_in_stock = bool(sv.get("in_stock", True))
+                        if sv.get("price"):
+                            variant_price = sv["price"]
+                        break
+            except Exception as exc:
+                logger.warning("Failed to parse variants_json for item #%s: %s", item_id, exc)
 
-        # 3. ЕДИНЫЙ ИСТОЧНИК ПРАВДЫ для наличия:
-        #    parse_product возвращает is_in_stock для конкретного размера
-        is_in_stock: bool = parsed.is_in_stock
+        # 3. Если variants_json не дал ответа — статус False по умолчанию,
+        #    так как неизвестный вариант лучше отметить как недоступный
+        #    (чтобы не показывать ложный «В наличии»)
+        if is_in_stock is None:
+            logger.warning(
+                "Variant '%s' not found in variants_json for item #%s, assuming in_stock=False",
+                size_name, item_id
+            )
+            is_in_stock = False
 
-        # 4. Формируем название с понятной меткой размера
-        size_pattern = re.compile(
-            r"^(XXS|XS|S|M|L|XL|XXL|3XL|4XL|5XL|[2-5]?XL|\d{2,3})$",
-            re.IGNORECASE
-        )
+        # 4. Формируем название с понятной меткой варианта
         variant_label = (
-            f"Размер: {size_name}" if size_pattern.match(size_name)
+            f"Размер: {size_name}" if _SIZE_PATTERN.match(size_name)
             else f"Вариант: {size_name}"
         )
 
-        raw_title = item.get("title") or parsed.title or ""
-        clean_base_title = re.sub(
-            r"\s*\((?:Размер|Вариант|Розмір):[^)]*\)", "",
-            raw_title, flags=re.IGNORECASE
-        ).strip()
+        raw_title = item.get("title") or ""
+        clean_base_title = _strip_variant_suffix(raw_title)
         full_title = f"{clean_base_title} ({variant_label})"
 
-        price = parsed.price or item.get("price") or ""
-        currency = parsed.currency or item.get("currency") or "₴"
-
-        # 5. Сохраняем все обновлённые параметры в SQLite (commit гарантирован)
+        # 5. Сохраняем ОБНОВЛЁННЫЕ данные в SQLite (commit гарантирован в database.py)
         await update_item_variant(
             item_id=item_id,
-            url=size_url,
+            url=item["url"],
             title=full_title,
-            price=price,
+            price=variant_price,
+            currency=variant_currency,
             is_in_stock=is_in_stock,
+            selected_variant=size_name,
         )
 
         logger.info(
-            "Size selected: item_id=%s size=%s in_stock=%s user=%s",
+            "Variant selected: item_id=%s variant='%s' in_stock=%s user=%s",
             item_id, size_name, is_in_stock, user_id
         )
 
-        result = ParseResult(
+        # 6. Строим карточку через _format_item_text — статус из is_in_stock
+        card_text = _format_item_text(
+            lang,
             title=full_title,
-            price=price,
-            currency=currency,
-            is_in_stock=is_in_stock,
-            source="variant_selector",
+            price=variant_price,
+            currency=variant_currency,
+            in_stock=is_in_stock,
         )
 
-        # 6. Заменяем меню выбора вариантов итоговой карточкой товара
+        # 7. Заменяем меню выбора вариантов итоговой карточкой товара
         await callback.message.edit_text(  # type: ignore[union-attr]
-            _card_from_result(lang, result),
+            card_text,
             parse_mode=ParseMode.HTML,
-            reply_markup=_item_kb(item_id, size_url, lang, full_title),
+            reply_markup=_item_kb(item_id, item["url"], lang, full_title),
         )
 
-        # 7. Подтверждение пользователю — разное сообщение в зависимости от наличия
+        # 8. Подтверждающее сообщение — зависит от наличия
         confirm_key = "variant_added_in_stock" if is_in_stock else "variant_target_added"
         await callback.message.answer(  # type: ignore[union-attr]
             t(lang, confirm_key, variant=size_name),
@@ -874,7 +950,7 @@ async def cb_select_size(callback: CallbackQuery) -> None:
             callback.data, exc, exc_info=True
         )
         try:
-            user_id = callback.from_user.id
+            user_id = int(callback.from_user.id)
             lang = await _get_lang(user_id) or "en"
             await callback.message.edit_text(  # type: ignore[union-attr]
                 t(lang, "parse_error"), parse_mode=ParseMode.HTML
@@ -900,13 +976,11 @@ async def main() -> None:
     dp.message.outer_middleware(UserAutoSaveMiddleware())
     dp.callback_query.outer_middleware(UserAutoSaveMiddleware())
 
-    # admin_router ОБЯЗАТЕЛЬНО регистрируем первым:
-    # его FSM-фильтр (BroadcastState) должен перехватывать сообщения
-    # раньше, чем универсальный F.text-обработчик основного роутера.
+    # admin_router ОБЯЗАТЕЛЬНО первым: FSM-фильтр перехватывает до основного роутера
     dp.include_router(admin_router)
     dp.include_router(router)
 
-    # Запускаем фоновый HTTP-сервер для Render Health Check
+    # Фоновый HTTP-сервер для Render Health Check
     port = int(os.getenv("PORT", "8080"))
     app = web.Application()
     app.router.add_get("/", lambda r: web.Response(text="Bot is running!"))
@@ -934,4 +1008,3 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-

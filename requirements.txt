@@ -5,3 +5,4 @@ beautifulsoup4==4.13.4
 google-genai==1.19.0
 aiosqlite==0.21.0
 aiohttp==3.11.13
+curl_cffi>=0.7.0
