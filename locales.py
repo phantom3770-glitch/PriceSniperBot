@@ -62,6 +62,12 @@ TEXTS: dict[str, dict[str, str]] = {
             "⚠️ Не вдалося отримати дані про товар.\n"
             "Перевірте посилання або спробуйте пізніше."
         ),
+        "antibot_error": (
+            "🛡 <b>Сайт захищений антибот-системою.</b>\n\n"
+            "На жаль, {domain} використовує JavaScript-захист (DDoS-Guard / Cloudflare PoW), "
+            "який неможливо обійти без реального браузера.\n\n"
+            "💡 Спробуйте інший товар або інший магазин."
+        ),
 
         # Картка товару (використовується у списку та після додавання)
         "item_card": (
@@ -178,6 +184,12 @@ TEXTS: dict[str, dict[str, str]] = {
             "⚠️ Could not retrieve product data.\n"
             "Check the link or try again later."
         ),
+        "antibot_error": (
+            "🛡 <b>This website uses antibot protection.</b>\n\n"
+            "Unfortunately, {domain} uses a JavaScript challenge (DDoS-Guard / Cloudflare PoW) "
+            "which cannot be bypassed without a real browser.\n\n"
+            "💡 Try a different product or a different store."
+        ),
 
         # Item card
         "item_card": (
@@ -293,6 +305,12 @@ TEXTS: dict[str, dict[str, str]] = {
         "parse_error": (
             "⚠️ Не удалось получить данные о товаре.\n"
             "Проверьте ссылку или попробуйте позже."
+        ),
+        "antibot_error": (
+            "🛡 <b>Сайт защищён антибот-системой.</b>\n\n"
+            "К сожалению, {domain} использует JavaScript-защиту (DDoS-Guard / Cloudflare PoW), "
+            "которую невозможно обойти без реального браузера.\n\n"
+            "💡 Попробуйте другой товар или другой магазин."
         ),
 
         # Карточка товара

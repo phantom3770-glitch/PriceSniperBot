@@ -76,7 +76,7 @@ from database import (
     upsert_user,
 )
 from locales import t
-from parser import ParseResult, parse_product
+from parser import JSChallengeError, ParseResult, _js_challenge_detected_domains, parse_product
 from scheduler import start_scheduler
 
 # ── Middleware автосохранения пользователей ───────────────────────────────────
@@ -788,11 +788,18 @@ async def handle_text(message: Message) -> None:
         result.is_in_stock, len(result.variants), url,
     )
 
-    # 3. Ошибка парсинга
+    # 3a. JS-challenge (сайт защищён DDoS-Guard / Cloudflare PoW)
     if result.source == "error" and not result.title and not result.price:
-        await status_msg.edit_text(
-            t(lang, "parse_error"), parse_mode=ParseMode.HTML
-        )
+        from urllib.parse import urlparse as _urlparse
+        _domain = _urlparse(url).netloc.removeprefix("www.")
+        if _domain in _js_challenge_detected_domains:
+            await status_msg.edit_text(
+                t(lang, "antibot_error", domain=_domain), parse_mode=ParseMode.HTML
+            )
+        else:
+            await status_msg.edit_text(
+                t(lang, "parse_error"), parse_mode=ParseMode.HTML
+            )
         return
 
     # 4. Сохраняем базовый товар в БД → получаем item_id
