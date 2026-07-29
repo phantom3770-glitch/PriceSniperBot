@@ -2,8 +2,9 @@
 database.py — асинхронная работа с SQLite через aiosqlite.
 
 Таблицы:
-  • users  — user_id + выбранный язык
-  • items  — отслеживаемые товары (ссылка, название, цена, наличие, вариант, JSON вариантов)
+  • users         — user_id + выбранный язык
+  • items         — отслеживаемые товары (ссылка, название, цена, старая цена, наличие, вариант, JSON вариантов)
+  • price_history — история изменения цен товаров для формирования графиков динамики
 
 Правила:
   - user_id всегда приводится к int
@@ -15,6 +16,7 @@ database.py — асинхронная работа с SQLite через aiosqli
 import json
 import logging
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -51,6 +53,8 @@ async def init_db() -> None:
                 url              TEXT    NOT NULL,
                 title            TEXT,
                 price            TEXT,
+                old_price        TEXT,
+                discount_percent INTEGER,
                 currency         TEXT,
                 in_stock         INTEGER NOT NULL DEFAULT 0,
                 selected_variant TEXT,
@@ -60,6 +64,18 @@ async def init_db() -> None:
                 FOREIGN KEY (user_id) REFERENCES users(user_id)
             )
         """)
+
+        # ── Таблица истории цен ───────────────────────────────────────────────
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS price_history (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                item_id    INTEGER NOT NULL,
+                price      REAL    NOT NULL,
+                old_price  REAL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE
+            )
+        """)
         await db.commit()
 
         # ── Авто-миграция: добавляем новые колонки в существующую БД ─────────
@@ -67,7 +83,8 @@ async def init_db() -> None:
             ("selected_variant", "TEXT"),
             ("variants_json",    "TEXT"),
             ("updated_at",       "TEXT"),
-            # Алиас is_in_stock → in_stock (старая БД может иметь is_in_stock)
+            ("old_price",        "TEXT"),
+            ("discount_percent", "INTEGER"),
         ]
         async with db.execute("PRAGMA table_info(items)") as cur:
             existing = {row[1] for row in await cur.fetchall()}
@@ -96,17 +113,98 @@ async def init_db() -> None:
                 logger.warning("[DB Migration] in_stock migration failed: %s", exc)
 
 
-# ── Утилита: текущее время UTC ────────────────────────────────────────────────
+# ── Утилиты ───────────────────────────────────────────────────────────────────
 def _now_utc() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _clean_price_num(val: float | str | None) -> float | None:
+    """Очищает форматированную цену и возвращает чистый float или None."""
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return float(val) if val > 0 else None
+    
+    s = str(val).strip()
+    if not s:
+        return None
+    
+    cleaned = re.sub(r"[^\d.,]", "", s)
+    if not cleaned:
+        return None
+    
+    if "," in cleaned and "." in cleaned:
+        cleaned = cleaned.replace(",", "")
+    elif "," in cleaned:
+        parts = cleaned.split(",")
+        if len(parts[-1]) == 2:
+            cleaned = cleaned.replace(",", ".")
+        else:
+            cleaned = cleaned.replace(",", "")
+            
+    try:
+        res = float(cleaned)
+        return res if res > 0 else None
+    except ValueError:
+        return None
+
+
+# ── История цен ───────────────────────────────────────────────────────────────
+async def add_price_record(
+    item_id: int,
+    price: float | str,
+    old_price: float | str | None = None,
+) -> None:
+    """
+    Сохраняет новую точку истории цен в таблицу price_history.
+    """
+    item_id = int(item_id)
+    p_float = _clean_price_num(price)
+    if p_float is None:
+        return
+
+    op_float = _clean_price_num(old_price)
+    now = _now_utc()
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO price_history (item_id, price, old_price, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (item_id, p_float, op_float, now),
+        )
+        await db.commit()
+
+
+async def get_price_history(item_id: int, limit: int = 30) -> list[tuple[str, float]]:
+    """
+    Возвращает хронологический список кортежей [(created_at, price), ...]
+    для товара, отсортированный по возрастанию даты.
+    """
+    item_id = int(item_id)
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """
+            SELECT created_at, price
+            FROM (
+                SELECT created_at, price, id
+                FROM   price_history
+                WHERE  item_id = ?
+                ORDER  BY id DESC
+                LIMIT  ?
+            )
+            ORDER BY id ASC
+            """,
+            (item_id, limit),
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [(str(row[0]), float(row[1])) for row in rows]
+
+
 # ── Users ─────────────────────────────────────────────────────────────────────
 async def ensure_user(user_id: int, default_lang: str = "en") -> None:
-    """
-    Гарантирует, что пользователь существует в БД.
-    Если запись уже есть, её данные (включая выбор языка) не перезаписываются.
-    """
+    """Гарантирует, что пользователь существует в БД."""
     user_id = int(user_id)
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
@@ -154,10 +252,13 @@ async def save_item(
     is_in_stock: bool,
     selected_variant: str | None = None,
     variants: list[dict] | None = None,
+    old_price: str | None = None,
+    discount_percent: int | None = None,
 ) -> int:
     """
     Сохраняет товар и возвращает его id.
-    Опционально сохраняет JSON-список вариантов и выбранный вариант.
+    Опционально сохраняет JSON-список вариантов, выбранный вариант, старую цену и процент скидки.
+    Также создаёт первую запись в источнике истории цен.
     """
     user_id = int(user_id)
     now = _now_utc()
@@ -167,20 +268,25 @@ async def save_item(
         cursor = await db.execute(
             """
             INSERT INTO items
-                (user_id, url, title, price, currency, in_stock,
-                 selected_variant, variants_json, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (user_id, url, title, price, old_price, discount_percent, currency,
+                 in_stock, selected_variant, variants_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                user_id, url, title, price, currency, int(is_in_stock),
-                selected_variant, variants_json_str, now, now,
+                user_id, url, title, price, old_price, discount_percent, currency,
+                int(is_in_stock), selected_variant, variants_json_str, now, now,
             ),
         )
         await db.commit()
-        return cursor.lastrowid  # type: ignore[return-value]
+        item_id = cursor.lastrowid  # type: ignore[assignment]
+
+    if item_id:
+        await add_price_record(item_id, price, old_price)
+
+    return item_id  # type: ignore[return-value]
 
 
-# Псевдоним функции сохранения (обратная совместимость)
+# Псевдоним функции сохранения
 add_item = save_item
 
 
@@ -232,21 +338,31 @@ async def update_item_data(
     price: str,
     currency: str,
     is_in_stock: bool,
+    old_price: str | None = None,
+    discount_percent: int | None = None,
 ) -> None:
     """
-    Обновляет цену, валюту и наличие товара после очередной проверки.
-    Вызывается планировщиком только при обнаружении изменений.
+    Обновляет цену, старую цену, скидку, валюту и наличие товара.
+    Сохраняет новую точку в истории цен.
     """
+    item_id = int(item_id)
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """
             UPDATE items
-            SET    price = ?, currency = ?, in_stock = ?, updated_at = ?
+            SET    price = ?, old_price = ?, discount_percent = ?,
+                   currency = ?, in_stock = ?, updated_at = ?
             WHERE  id = ?
             """,
-            (price, currency, int(is_in_stock), _now_utc(), item_id),
+            (price, old_price, discount_percent, currency, int(is_in_stock), _now_utc(), item_id),
         )
         await db.commit()
+
+    await add_price_record(item_id, price, old_price)
+
+
+# Совместимый алиас для планировщика
+update_item_price = update_item_data
 
 
 async def update_item_variant(
@@ -257,30 +373,35 @@ async def update_item_variant(
     currency: str,
     is_in_stock: bool,
     selected_variant: str | None = None,
+    old_price: str | None = None,
+    discount_percent: int | None = None,
 ) -> None:
     """
-    Обновляет URL, название, цену, валюту, наличие и выбранный вариант товара.
-    Вызывается при выборе пользователем конкретного размера/варианта.
-    Всегда завершается commit().
+    Обновляет URL, название, цену, старую цену, скидку, валюту, наличие и выбранный вариант.
+    Сохраняет новую точку в истории цен.
     """
     item_id = int(item_id)
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """
             UPDATE items
-            SET    url = ?, title = ?, price = ?, currency = ?,
-                   in_stock = ?, selected_variant = ?, updated_at = ?
+            SET    url = ?, title = ?, price = ?, old_price = ?, discount_percent = ?,
+                   currency = ?, in_stock = ?, selected_variant = ?, updated_at = ?
             WHERE  id = ?
             """,
-            (url, title, price, currency, int(is_in_stock), selected_variant, _now_utc(), item_id),
+            (
+                url, title, price, old_price, discount_percent,
+                currency, int(is_in_stock), selected_variant, _now_utc(), item_id,
+            ),
         )
         await db.commit()
+
+    await add_price_record(item_id, price, old_price)
 
 
 async def update_item_variants_json(item_id: int, variants: list[dict]) -> None:
     """
-    Сохраняет JSON-список всех вариантов товара (размеры + статус наличия).
-    Используется для stateless-кнопок выбора размера без повторного HTTP-запроса.
+    Сохраняет JSON-список всех вариантов товара.
     """
     item_id = int(item_id)
     variants_json_str = json.dumps(variants, ensure_ascii=False)
@@ -295,7 +416,6 @@ async def update_item_variants_json(item_id: int, variants: list[dict]) -> None:
 async def delete_item(item_id: int, user_id: int) -> None:
     """
     Удаляет товар из БД.
-    Проверяет user_id для защиты от удаления чужих товаров.
     """
     user_id = int(user_id)
     async with aiosqlite.connect(DB_PATH) as db:
@@ -317,27 +437,20 @@ async def get_all_user_ids() -> list[int]:
 
 async def get_admin_stats() -> dict:
     """
-    Возвращает агрегированную статистику для панели администратора:
-      - user_count  : общее число пользователей
-      - item_count  : общее число товаров в базе
-      - top_domains : топ-3 доменов по числу товаров [(domain, count), ...]
+    Возвращает агрегированную статистику для панели администратора.
     """
     from urllib.parse import urlparse
 
     async with aiosqlite.connect(DB_PATH) as db:
-        # Пользователи
         async with db.execute("SELECT COUNT(*) FROM users") as cur:
             user_count: int = (await cur.fetchone())[0]  # type: ignore[index]
 
-        # Товары
         async with db.execute("SELECT COUNT(*) FROM items") as cur:
             item_count: int = (await cur.fetchone())[0]  # type: ignore[index]
 
-        # Все URL для подсчёта доменов
         async with db.execute("SELECT url FROM items") as cur:
             urls = [row[0] for row in await cur.fetchall()]
 
-    # Считаем частоту доменов
     domain_counts: dict[str, int] = {}
     for url in urls:
         try:

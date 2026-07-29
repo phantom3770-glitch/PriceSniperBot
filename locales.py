@@ -36,6 +36,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "btn_share_item":      "📤 Поділитися товаром",
         "btn_send_to_friend":  "📤 Надіслати другу",
         "btn_add_to_tracking": "✅ Додати до відстеження",
+        "btn_price_history":   "📊 Історія цін",
 
         # Повідомлення про посилання / шеринг
         "invite_msg": (
@@ -72,11 +73,17 @@ TEXTS: dict[str, dict[str, str]] = {
         # Картка товару (використовується у списку та після додавання)
         "item_card": (
             "📌 <b>{title}</b>\n\n"
-            "💰 Ціна: <b>{price_str}</b>\n"
+            "💰 Ціна: <b>{price_str}</b>{discount_str}\n"
             "📦 Статус: {stock_emoji} <b>{stock_label}</b>"
         ),
+        "discount_info": "\n🔥 Знижка: <b>-{discount}%</b> (економія <b>{savings}</b>)",
         "item_added": "✅ <b>Ціль додано до списку відстеження!</b>",
         "save_error": "⚠️ <b>Помилка збереження!</b> Не вдалося зберегти товар. Спробуйте ще раз.",
+        "history_not_enough_data": (
+            "📊 <b>Недостатньо даних для графіка.</b>\n"
+            "Завітайте через пару днів, коли бот накопичить історію перевірок!"
+        ),
+        "history_chart_caption": "📊 <b>Динаміка зміни ціни</b>",
 
         # Список товарів
         "list_header": "📋 <b>Ваші товари ({count} шт.):</b>",
@@ -158,6 +165,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "btn_share_item":      "📤 Share Item",
         "btn_send_to_friend":  "📤 Send to Friend",
         "btn_add_to_tracking": "✅ Add to Tracking",
+        "btn_price_history":   "📊 Price History",
 
         # Sharing / Invite messages
         "invite_msg": (
@@ -194,11 +202,17 @@ TEXTS: dict[str, dict[str, str]] = {
         # Item card
         "item_card": (
             "📌 <b>{title}</b>\n\n"
-            "💰 Price: <b>{price_str}</b>\n"
+            "💰 Price: <b>{price_str}</b>{discount_str}\n"
             "📦 Status: {stock_emoji} <b>{stock_label}</b>"
         ),
+        "discount_info": "\n🔥 Discount: <b>-{discount}%</b> (save <b>{savings}</b>)",
         "item_added": "✅ <b>Target added to tracking list!</b>",
         "save_error": "⚠️ <b>Save Error!</b> Failed to save the item. Please try again.",
+        "history_not_enough_data": (
+            "📊 <b>Not enough data for chart.</b>\n"
+            "Check back in a few days when the bot collects check history!"
+        ),
+        "history_chart_caption": "📊 <b>Price Dynamics</b>",
 
         # Item list
         "list_header": "📋 <b>Your Items ({count}):</b>",
@@ -280,6 +294,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "btn_share_item":      "📤 Поделиться товаром",
         "btn_send_to_friend":  "📤 Отправить другу",
         "btn_add_to_tracking": "✅ Добавить в отслеживание",
+        "btn_price_history":   "📊 История цен",
 
         # Сообщения при шеринге и приглашениях
         "invite_msg": (
@@ -316,11 +331,17 @@ TEXTS: dict[str, dict[str, str]] = {
         # Карточка товара
         "item_card": (
             "📌 <b>{title}</b>\n\n"
-            "💰 Цена: <b>{price_str}</b>\n"
+            "💰 Цена: <b>{price_str}</b>{discount_str}\n"
             "📦 Статус: {stock_emoji} <b>{stock_label}</b>"
         ),
+        "discount_info": "\n🔥 Скидка: <b>-{discount}%</b> (экономия <b>{savings}</b>)",
         "item_added": "✅ <b>Цель добавлена в список отслеживания!</b>",
         "save_error": "⚠️ <b>Ошибка сохранения!</b> Не удалось сохранить товар. Попробуйте еще раз.",
+        "history_not_enough_data": (
+            "📊 <b>Недостаточно данных для графика.</b>\n"
+            "Зайдите через пару дней, когда бот накопит историю проверок!"
+        ),
+        "history_chart_caption": "📊 <b>Динамика изменения цены</b>",
 
         # Список товаров
         "list_header": "📋 <b>Ваши товары ({count} шт.):</b>",

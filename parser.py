@@ -96,8 +96,57 @@ class ParseResult:
     currency: str     # символ или код: «₴», «USD»
     is_in_stock: bool
     source: str       # «shopify_json» | «jsonld» | «css» | «gemini» | «error»
+    old_price: str = "" # старая / зачёркнутая цена (если есть и выше текущей)
+    discount_percent: int | None = None # процент скидки (если old_price > price)
     variants: list[dict] = field(default_factory=list)
     # Каждый вариант: {"id": str, "title": str, "in_stock": bool, "price": str}
+
+
+def _clean_price_float(val: float | str | None) -> float | None:
+    """Конвертирует форматированную строку цены в float или None."""
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return float(val) if val > 0 else None
+    
+    s = str(val).strip()
+    if not s:
+        return None
+    
+    cleaned = re.sub(r"[^\d.,]", "", s)
+    if not cleaned:
+        return None
+    
+    if "," in cleaned and "." in cleaned:
+        cleaned = cleaned.replace(",", "")
+    elif "," in cleaned:
+        parts = cleaned.split(",")
+        if len(parts[-1]) == 2:
+            cleaned = cleaned.replace(",", ".")
+        else:
+            cleaned = cleaned.replace(",", "")
+            
+    try:
+        res = float(cleaned)
+        return res if res > 0 else None
+    except ValueError:
+        return None
+
+
+def _calc_discount(price_str: str | None, old_price_str: str | None) -> tuple[str, str, int | None]:
+    """
+    Принимает текущую и старую цену.
+    Возвращает (price_str, valid_old_price_str, discount_percent).
+    Если старая цена не выше текущей, valid_old_price_str будет "" и discount_percent = None.
+    """
+    p_float = _clean_price_float(price_str)
+    op_float = _clean_price_float(old_price_str)
+    
+    if p_float is not None and op_float is not None and op_float > p_float:
+        discount = round(((op_float - p_float) / op_float) * 100)
+        return str(price_str or ""), str(old_price_str or ""), discount
+    
+    return str(price_str or ""), "", None
 
 
 # ── Утилита: очистка URL ──────────────────────────────────────────────────────
@@ -462,6 +511,8 @@ def _filter_shopify_variants_by_html(result: ParseResult, soup: BeautifulSoup) -
         currency=result.currency,
         is_in_stock=bool(in_stock_vs),
         source=result.source,
+        old_price=result.old_price,
+        discount_percent=result.discount_percent,
         variants=filtered,
     )
 
@@ -559,12 +610,17 @@ async def _parse_shopify_json(url: str) -> ParseResult | None:
         if "." in v_price:
             v_price = v_price.rstrip("0").rstrip(".")
 
+        v_compare_price = str(v.get("compare_at_price") or "").strip()
+        if "." in v_compare_price:
+            v_compare_price = v_compare_price.rstrip("0").rstrip(".")
+
         if v_title:
             variants_list.append({
                 "id": v_id,
                 "title": v_title,
                 "in_stock": v_available,
                 "price": v_price,
+                "old_price": v_compare_price,
             })
 
     currency = "₴" if any(d in parsed.netloc for d in [".ua", "peresvit", "ukraine"]) else "$"
@@ -595,16 +651,24 @@ async def _parse_shopify_json(url: str) -> ParseResult | None:
     if matched_v:
         v_title = matched_v["title"]
         label = f"Размер: {v_title}" if _SIZE_PATTERN.match(v_title) else f"Вариант: {v_title}"
+        matched_price = matched_v["price"]
+        matched_old_price = matched_v.get("old_price", "")
+        _, valid_old_price, discount = _calc_discount(matched_price, matched_old_price)
+
         return ParseResult(
             title=f"{base_title} ({label})",
-            price=matched_v["price"],
+            price=matched_price,
             currency=currency,
             is_in_stock=matched_v["in_stock"],
             source="shopify_json",
+            old_price=valid_old_price,
+            discount_percent=discount,
             variants=[],
         )
 
     first_price = variants_list[0]["price"] if variants_list else ""
+    first_old_price = variants_list[0].get("old_price", "") if variants_list else ""
+    _, valid_old_price, discount = _calc_discount(first_price, first_old_price)
     overall_in_stock = any(v["in_stock"] for v in variants_list)
 
     return ParseResult(
@@ -613,6 +677,8 @@ async def _parse_shopify_json(url: str) -> ParseResult | None:
         currency=currency,
         is_in_stock=overall_in_stock,
         source="shopify_json",
+        old_price=valid_old_price,
+        discount_percent=discount,
         variants=variants_list,
     )
 
@@ -643,12 +709,23 @@ def _parse_jsonld(soup: BeautifulSoup) -> ParseResult | None:
                 offers = offers[0] if offers else {}
 
             price_raw = str(offers.get("price", "")).strip()
+            old_price_raw = str(offers.get("highPrice") or offers.get("comparePrice") or "").strip()
             currency = str(offers.get("priceCurrency", "")).strip()
             availability = str(offers.get("availability", ""))
             is_in_stock = "InStock" in availability
 
+            _, valid_old_price, discount = _calc_discount(price_raw, old_price_raw)
+
             if title and price_raw:
-                return ParseResult(title, price_raw, currency, is_in_stock, "jsonld")
+                return ParseResult(
+                    title=title,
+                    price=price_raw,
+                    currency=currency,
+                    is_in_stock=is_in_stock,
+                    source="jsonld",
+                    old_price=valid_old_price,
+                    discount_percent=discount,
+                )
 
     return None
 
@@ -668,11 +745,62 @@ def _parse_css(
         title = tag.get_text(strip=True)
 
     price, currency = _extract_price(soup)
+    old_price = _extract_old_price(soup, price)
+    _, valid_old_price, discount = _calc_discount(price, old_price)
     is_in_stock = _extract_availability(soup, url, embedded_variants)
 
     if title and price:
-        return ParseResult(title, price, currency, is_in_stock, "css")
+        return ParseResult(
+            title=title,
+            price=price,
+            currency=currency,
+            is_in_stock=is_in_stock,
+            source="css",
+            old_price=valid_old_price,
+            discount_percent=discount,
+        )
     return None
+
+
+def _extract_old_price(soup: BeautifulSoup, current_price: str = "") -> str:
+    """
+    Ищет зачёркнутую / старую цену на странице.
+    Теги: <del>, <s>, классы: .old-price, .compare-at-price, .original-price, [data-old-price], .was-price, .price--compare
+    """
+    old_price_selectors = [
+        "del",
+        "s",
+        "[data-old-price]",
+        ".old-price",
+        ".compare-at-price",
+        ".original-price",
+        ".was-price",
+        ".price--compare",
+        ".price-old",
+        ".old_price",
+        "[itemprop='highPrice']",
+    ]
+    digit_re = re.compile(r"[\d\s,.]+")
+    curr_float = _clean_price_float(current_price)
+
+    for sel in old_price_selectors:
+        elements = soup.select(sel)
+        for el in elements:
+            if _is_hidden(el):
+                continue
+            raw = (el.get("content") or el.get("data-old-price") or el.get_text(strip=True))
+            if not raw:
+                continue
+            nums = digit_re.findall(raw)
+            if not nums:
+                continue
+            candidate = nums[0].strip().replace(" ", "")
+            cand_float = _clean_price_float(candidate)
+            
+            if cand_float and (curr_float is None or cand_float > curr_float):
+                return candidate
+
+    return ""
 
 
 def _extract_price(soup: BeautifulSoup) -> tuple[str, str]:
@@ -1247,6 +1375,8 @@ def _apply_variant_info(
         currency=result.currency,
         is_in_stock=is_in_stock,
         source=result.source,
+        old_price=result.old_price,
+        discount_percent=result.discount_percent,
         variants=all_variants,
     )
 
@@ -1284,7 +1414,7 @@ async def _parse_gemini(url: str, html: str, json_snippet: str = "") -> ParseRes
 
     prompt_parts.append(
         "Верни ИСКЛЮЧИТЕЛЬНО валидный JSON:\n"
-        '{"title": "...", "price": "...", "currency": "...", "is_in_stock": true/false}\n'
+        '{"title": "...", "price": "...", "old_price": "старая цена если есть, иначе null", "currency": "...", "is_in_stock": true/false}\n'
     )
 
     if truncated:
@@ -1302,12 +1432,18 @@ async def _parse_gemini(url: str, html: str, json_snippet: str = "") -> ParseRes
         text = re.sub(r"^```(?:json)?\s*", "", text)
         text = re.sub(r"\s*```$", "", text)
         data = json.loads(text)
+        price_val = str(data.get("price") or "").strip()
+        old_price_val = str(data.get("old_price") or "").strip() if data.get("old_price") else ""
+        _, valid_old_price, discount = _calc_discount(price_val, old_price_val)
+
         return ParseResult(
             title=str(data.get("title") or "").strip(),
-            price=str(data.get("price") or "").strip(),
+            price=price_val,
             currency=str(data.get("currency") or "").strip(),
             is_in_stock=bool(data.get("is_in_stock", False)),
             source="gemini",
+            old_price=valid_old_price,
+            discount_percent=discount,
         )
     except Exception as exc:
         logger.error("Gemini parse error for %s: %s", url, exc)

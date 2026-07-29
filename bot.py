@@ -61,11 +61,12 @@ from aiogram.types import (
     User,
 )
 
-from admin import ADMIN_ID, admin_router
+from chart_service import generate_chart_url
 from database import (
     delete_item,
     ensure_user,
     get_item_by_id,
+    get_price_history,
     get_user_items,
     get_user_language,
     init_db,
@@ -76,7 +77,13 @@ from database import (
     upsert_user,
 )
 from locales import t
-from parser import JSChallengeError, ParseResult, _js_challenge_detected_domains, parse_product
+from parser import (
+    JSChallengeError,
+    ParseResult,
+    _clean_price_float,
+    _js_challenge_detected_domains,
+    parse_product,
+)
 from scheduler import start_scheduler
 
 # ── Middleware автосохранения пользователей ───────────────────────────────────
@@ -202,6 +209,10 @@ def _item_kb(item_id: int, url: str, lang: str, title: str = "") -> InlineKeyboa
             ],
             [
                 InlineKeyboardButton(
+                    text=t(lang, "btn_price_history"),
+                    callback_data=f"hist:{item_id}",
+                ),
+                InlineKeyboardButton(
                     text=t(lang, "btn_share_item"),
                     url=share_url,
                 ),
@@ -322,37 +333,58 @@ def _format_item_text(
     price: str,
     currency: str,
     in_stock: int | bool,
+    old_price: str | None = None,
+    discount_percent: int | None = None,
 ) -> str:
     """
     Единственный источник правды для отображения карточки товара.
-    Статус читается ИСКЛЮЧИТЕЛЬНО из переданного поля in_stock (0/1 из SQLite или bool).
-      in_stock == 1 (True)  → ✅ В наличии
-      in_stock == 0 (False) → ❌ Нет в наличии
+    При наличии старой цены и скидки выводит зачёркнутую цену и размер экономии.
     """
     display_title = title or t(lang, "title_unknown")
-    price_str = (
-        f"{price} {currency}".strip() if price else t(lang, "price_unknown")
-    )
+
+    p_float = _clean_price_float(price)
+    op_float = _clean_price_float(old_price) if old_price else None
+
+    price_str = f"{price} {currency}".strip() if price else t(lang, "price_unknown")
+    discount_str = ""
+
+    if p_float and op_float and op_float > p_float:
+        savings_val = int(op_float - p_float)
+        discount_val = (
+            discount_percent
+            if discount_percent is not None
+            else round(((op_float - p_float) / op_float) * 100)
+        )
+        price_str = f"{price} {currency} (<s>{old_price} {currency}</s>)".strip()
+        savings_formatted = f"{savings_val} {currency}".strip()
+        discount_str = t(
+            lang, "discount_info", discount=discount_val, savings=savings_formatted
+        )
+
     is_available = bool(int(in_stock) if isinstance(in_stock, (int, str)) else in_stock)
     stock_emoji = "✅" if is_available else "❌"
     stock_label = t(lang, "stock_yes" if is_available else "stock_no")
+
     return t(
         lang, "item_card",
         title=display_title,
         price_str=price_str,
+        discount_str=discount_str,
         stock_emoji=stock_emoji,
         stock_label=stock_label,
     )
 
 
 def _card_from_db(lang: str, item: dict) -> str:
-    """Форматирует карточку из записи БД. Статус берётся из поля in_stock."""
+    """Форматирует карточку из записи БД."""
     return _format_item_text(
         lang,
         title=item.get("title") or "",
         price=item.get("price") or "",
         currency=item.get("currency") or "",
         in_stock=item.get("in_stock", 0),
+        old_price=item.get("old_price"),
+        discount_percent=item.get("discount_percent"),
     )
 
 
@@ -364,6 +396,8 @@ def _card_from_result(lang: str, result: ParseResult) -> str:
         price=result.price,
         currency=result.currency,
         in_stock=result.is_in_stock,
+        old_price=result.old_price,
+        discount_percent=result.discount_percent,
     )
 
 
@@ -612,7 +646,12 @@ async def btn_refresh(message: Message) -> None:
             result = await parse_product(item["url"])
             if result.source != "error":
                 await update_item_data(
-                    item["id"], result.price, result.currency, result.is_in_stock
+                    item["id"],
+                    result.price,
+                    result.currency,
+                    result.is_in_stock,
+                    old_price=result.old_price,
+                    discount_percent=result.discount_percent,
                 )
                 updated += 1
         except Exception as exc:
@@ -813,6 +852,8 @@ async def handle_text(message: Message) -> None:
             currency=result.currency,
             is_in_stock=result.is_in_stock,
             variants=result.variants if result.variants else None,
+            old_price=result.old_price,
+            discount_percent=result.discount_percent,
         )
     except Exception as exc:
         logger.error("Failed to save item for user %s: %s", user_id, exc, exc_info=True)
@@ -921,6 +962,8 @@ async def cb_select_size(callback: CallbackQuery) -> None:
             currency=variant_currency,
             is_in_stock=is_in_stock,
             selected_variant=size_name,
+            old_price=item.get("old_price"),
+            discount_percent=item.get("discount_percent"),
         )
 
         logger.info(
@@ -964,6 +1007,43 @@ async def cb_select_size(callback: CallbackQuery) -> None:
             )
         except Exception:
             pass
+
+
+# ── Callback: история цен и график ───────────────────────────────────────────
+@router.callback_query(F.data.startswith("hist:"))
+async def cb_price_history(callback: CallbackQuery) -> None:
+    """
+    Обработчик кнопки «📊 История цен».
+    Генерирует график динамики цен через QuickChart API и отправляет картинку.
+    """
+    await callback.answer()
+
+    try:
+        item_id = int(callback.data.split(":")[1])  # type: ignore[union-attr]
+        user_id = int(callback.from_user.id)
+        lang = await _get_lang(user_id) or "en"
+
+        history = await get_price_history(item_id, limit=30)
+        if len(history) < 2:
+            await callback.message.answer(  # type: ignore[union-attr]
+                t(lang, "history_not_enough_data"),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        chart_url = generate_chart_url(history)
+        await callback.message.answer_photo(  # type: ignore[union-attr]
+            photo=chart_url,
+            caption=t(lang, "history_chart_caption"),
+            parse_mode=ParseMode.HTML,
+        )
+
+    except Exception as exc:
+        logger.error(
+            "cb_price_history error [data=%s]: %s",
+            callback.data, exc, exc_info=True
+        )
+
 
 
 # ── Точка входа ───────────────────────────────────────────────────────────────
