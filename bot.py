@@ -63,6 +63,7 @@ from aiogram.types import (
 
 from chart_service import generate_chart_url
 from database import (
+    check_and_migrate_db,
     delete_item,
     ensure_user,
     get_item_by_id,
@@ -1048,8 +1049,9 @@ async def cb_price_history(callback: CallbackQuery) -> None:
 
 # ── Точка входа ───────────────────────────────────────────────────────────────
 async def main() -> None:
+    await check_and_migrate_db()
     await init_db()
-    logger.info("Database initialised.")
+    logger.info("Database initialised and migrated.")
 
     bot = Bot(
         token=BOT_TOKEN,

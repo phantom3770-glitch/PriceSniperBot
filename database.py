@@ -29,11 +29,69 @@ BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = os.getenv("DB_PATH", str((BASE_DIR / "price_sniper.db").resolve()))
 
 
-# ── Инициализация ─────────────────────────────────────────────────────────────
+# ── Инициализация и авто-миграция ─────────────────────────────────────────────
+async def check_and_migrate_db() -> None:
+    """
+    Проверяет и выполняет авто-миграцию структуры SQLite БД:
+      1. Создает таблицу price_history (если она еще не существует)
+      2. Выполняет PRAGMA table_info(items) для проверки существующих колонок
+      3. Если колонка old_price отсутствует — выполняет ALTER TABLE items ADD COLUMN old_price REAL
+      4. Безопасно добавляет все остальные необходимые колонки (selected_variant, variants_json, updated_at, discount_percent, in_stock)
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        # 1. Создание таблицы price_history
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS price_history (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                item_id    INTEGER,
+                price      REAL,
+                old_price  REAL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await db.commit()
+
+        # 2. Проверка колонок таблицы items
+        async with db.execute("PRAGMA table_info(items)") as cur:
+            existing = {row[1] for row in await cur.fetchall()}
+
+        # 3. Список требуемых колонок (имя, тип)
+        new_columns = [
+            ("old_price",        "REAL"),
+            ("discount_percent", "INTEGER"),
+            ("selected_variant", "TEXT"),
+            ("variants_json",    "TEXT"),
+            ("updated_at",       "TEXT"),
+        ]
+
+        # 4. Выполнение ALTER TABLE при отсутствии колонок
+        for col_name, col_type in new_columns:
+            if col_name not in existing:
+                try:
+                    await db.execute(
+                        f"ALTER TABLE items ADD COLUMN {col_name} {col_type}"
+                    )
+                    await db.commit()
+                    logger.info("[DB Migration] Added column: items.%s (%s)", col_name, col_type)
+                except Exception as exc:
+                    logger.warning("[DB Migration] Could not add column %s: %s", col_name, exc)
+
+        # Совместимость со старой схемой (is_in_stock -> in_stock)
+        if "is_in_stock" in existing and "in_stock" not in existing:
+            try:
+                await db.execute(
+                    "ALTER TABLE items ADD COLUMN in_stock INTEGER NOT NULL DEFAULT 0"
+                )
+                await db.execute("UPDATE items SET in_stock = is_in_stock")
+                await db.commit()
+                logger.info("[DB Migration] Migrated is_in_stock -> in_stock")
+            except Exception as exc:
+                logger.warning("[DB Migration] in_stock migration failed: %s", exc)
+
+
 async def init_db() -> None:
     """
-    Создаёт таблицы, если их ещё нет.
-    При повторном запуске безопасно добавляет новые колонки (авто-миграция).
+    Создаёт базовые таблицы пользователей и товаров, а затем запускает check_and_migrate_db().
     """
     async with aiosqlite.connect(DB_PATH) as db:
         # ── Таблица пользователей ─────────────────────────────────────────────
@@ -53,7 +111,7 @@ async def init_db() -> None:
                 url              TEXT    NOT NULL,
                 title            TEXT,
                 price            TEXT,
-                old_price        TEXT,
+                old_price        REAL,
                 discount_percent INTEGER,
                 currency         TEXT,
                 in_stock         INTEGER NOT NULL DEFAULT 0,
@@ -64,53 +122,9 @@ async def init_db() -> None:
                 FOREIGN KEY (user_id) REFERENCES users(user_id)
             )
         """)
-
-        # ── Таблица истории цен ───────────────────────────────────────────────
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS price_history (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                item_id    INTEGER NOT NULL,
-                price      REAL    NOT NULL,
-                old_price  REAL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE
-            )
-        """)
         await db.commit()
 
-        # ── Авто-миграция: добавляем новые колонки в существующую БД ─────────
-        new_columns = [
-            ("selected_variant", "TEXT"),
-            ("variants_json",    "TEXT"),
-            ("updated_at",       "TEXT"),
-            ("old_price",        "TEXT"),
-            ("discount_percent", "INTEGER"),
-        ]
-        async with db.execute("PRAGMA table_info(items)") as cur:
-            existing = {row[1] for row in await cur.fetchall()}
-
-        for col_name, col_type in new_columns:
-            if col_name not in existing:
-                try:
-                    await db.execute(
-                        f"ALTER TABLE items ADD COLUMN {col_name} {col_type}"
-                    )
-                    await db.commit()
-                    logger.info("[DB Migration] Added column: items.%s", col_name)
-                except Exception as exc:
-                    logger.warning("[DB Migration] Could not add column %s: %s", col_name, exc)
-
-        # Совместимость: если в старой БД колонка называется is_in_stock, а не in_stock
-        if "is_in_stock" in existing and "in_stock" not in existing:
-            try:
-                await db.execute(
-                    "ALTER TABLE items ADD COLUMN in_stock INTEGER NOT NULL DEFAULT 0"
-                )
-                await db.execute("UPDATE items SET in_stock = is_in_stock")
-                await db.commit()
-                logger.info("[DB Migration] Migrated is_in_stock -> in_stock")
-            except Exception as exc:
-                logger.warning("[DB Migration] in_stock migration failed: %s", exc)
+    await check_and_migrate_db()
 
 
 # ── Утилиты ───────────────────────────────────────────────────────────────────
